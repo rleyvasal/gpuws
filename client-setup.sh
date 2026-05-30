@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LINUX_USER="__LINUX_USER__"
+WINDOWS_USER="__WINDOWS_USER__"
+LINUX_SSH_PORT="__LINUX_SSH_PORT__"
+WINDOWS_SSH_PORT="__WINDOWS_SSH_PORT__"
+CF_HOSTNAME_LINUX="__CF_HOSTNAME_LINUX__"
+CF_HOSTNAME_WIN="__CF_HOSTNAME_WIN__"
+DEFAULT_NAME="__DEFAULT_NAME__"
+WORK_DIR="__WORK_DIR__"
+VENV_PATH="__VENV_PATH__"
+
+IDENTITY_FILE=""
+
+log() {
+    echo "$*"
+}
+
+warn() {
+    echo "Warning: $*" >&2
+}
+
+fail() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+ensure_cloudflared() {
+    if command -v cloudflared >/dev/null 2>&1; then
+        log "cloudflared already installed"
+        return 0
+    fi
+
+    local os
+    os="$(uname -s)"
+
+    case "$os" in
+        Linux)
+            log "cloudflared not found. Installing on Linux..."
+            local tmp_deb
+            tmp_deb="$(mktemp /tmp/cloudflared.XXXXXX.deb)"
+            curl -fsSL \
+              "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb" \
+              -o "$tmp_deb"
+            sudo dpkg -i "$tmp_deb" || sudo apt-get install -f -y
+            rm -f "$tmp_deb"
+            ;;
+        Darwin)
+            if command -v brew >/dev/null 2>&1; then
+                log "cloudflared not found. Installing with Homebrew..."
+                brew install cloudflared
+            else
+                fail "cloudflared is required. Install Homebrew or install cloudflared manually, then rerun this script."
+            fi
+            ;;
+        *)
+            fail "Unsupported OS for automatic cloudflared install: $os"
+            ;;
+    esac
+
+    if ! command -v cloudflared >/dev/null 2>&1; then
+        fail "cloudflared install did not succeed. Install it manually and rerun this script."
+    fi
+}
+
+ensure_cloudflared_symlink() {
+    local stable_dir="$HOME/.local/bin"
+    local stable_path="$stable_dir/cloudflared"
+    local actual_path
+
+    actual_path="$(command -v cloudflared 2>/dev/null || true)"
+    [ -n "$actual_path" ] || fail "cloudflared is not installed or not on PATH"
+
+    mkdir -p "$stable_dir"
+
+    if [ -L "$stable_path" ]; then
+        local current_target
+        current_target="$(readlink "$stable_path" 2>/dev/null || true)"
+        if [ "$current_target" = "$actual_path" ]; then
+            log "cloudflared symlink already configured"
+            return 0
+        fi
+    elif [ -x "$stable_path" ] && [ ! -L "$stable_path" ]; then
+        warn "$stable_path already exists and is not a symlink; leaving it unchanged"
+        return 0
+    fi
+
+    ln -sf "$actual_path" "$stable_path"
+
+    if [ ! -x "$stable_path" ]; then
+        fail "Failed to create working cloudflared symlink at $stable_path"
+    fi
+
+    log "cloudflared available at $stable_path"
+}
+
+confirm_identity_file() {
+    local default_identity="~/.ssh/id_ed25519"
+    local input_path
+    local expanded_path
+
+    read -r -p "Identity file path [$default_identity]: " input_path
+    input_path="${input_path:-$default_identity}"
+
+    expanded_path="${input_path/#\~/$HOME}"
+
+    if [ -f "$expanded_path" ]; then
+        IDENTITY_FILE="$input_path"
+        return 0
+    fi
+
+    warn "Identity file not found at $expanded_path"
+    read -r -p "Enter the correct identity file path: " input_path
+    [ -n "$input_path" ] || fail "Identity file is required"
+
+    expanded_path="${input_path/#\~/$HOME}"
+    [ -f "$expanded_path" ] || fail "Identity file not found at $expanded_path"
+
+    IDENTITY_FILE="$input_path"
+}
+
+write_client_config() {
+    local config_dir="$HOME/.config/gpuws"
+    local config_file="$config_dir/client.json"
+
+    mkdir -p "$config_dir"
+
+    cat > "$config_file" <<EOF
+{
+  "linux_user": "$LINUX_USER",
+  "windows_user": "$WINDOWS_USER",
+  "linux_ssh_port": $LINUX_SSH_PORT,
+  "windows_ssh_port": $WINDOWS_SSH_PORT,
+  "cf_hostname_linux": "$CF_HOSTNAME_LINUX",
+  "cf_hostname_win": "$CF_HOSTNAME_WIN",
+  "identity_file": "$IDENTITY_FILE",
+  "default_name": "$DEFAULT_NAME",
+  "work_dir": "$WORK_DIR",
+  "venv_path": "$VENV_PATH"
+}
+EOF
+
+    chmod 700 "$config_dir"
+    chmod 600 "$config_file"
+
+    log "Client configuration written to $config_file"
+}
+
+update_ssh_config() {
+    local ssh_dir="$HOME/.ssh"
+    local ssh_config="$ssh_dir/config"
+    local proxy_cmd="$HOME/.local/bin/cloudflared access tcp --hostname"
+
+    mkdir -p "$ssh_dir"
+    touch "$ssh_config"
+
+    local content
+    content="$(cat "$ssh_config")"
+
+    content="$(printf '%s' "$content" | perl -0pe 's/^Host gpuws-linux\b.*?(?=^Host |\z)//msg')"
+    content="$(printf '%s' "$content" | perl -0pe 's/^Host gpuws-windows\b.*?(?=^Host |\z)//msg')"
+
+    printf '%s\n' "$content" | sed '/^[[:space:]]*$/N;/^\n$/D' > "$ssh_config"
+
+    cat >> "$ssh_config" <<EOF
+
+Host gpuws-linux
+  HostName $CF_HOSTNAME_LINUX
+  Port $LINUX_SSH_PORT
+  User $LINUX_USER
+  IdentityFile $IDENTITY_FILE
+  ProxyCommand $proxy_cmd $CF_HOSTNAME_LINUX
+  ControlMaster auto
+  ControlPath ~/.ssh/control-%r@%h:%p
+  ControlPersist yes
+  ServerAliveInterval 60
+  ServerAliveCountMax 10
+EOF
+
+    if [ -n "$CF_HOSTNAME_WIN" ] && [ -n "$WINDOWS_USER" ]; then
+        cat >> "$ssh_config" <<EOF
+
+Host gpuws-windows
+  HostName $CF_HOSTNAME_WIN
+  Port $WINDOWS_SSH_PORT
+  User $WINDOWS_USER
+  IdentityFile $IDENTITY_FILE
+  ProxyCommand $proxy_cmd $CF_HOSTNAME_WIN
+  ServerAliveInterval 60
+  ServerAliveCountMax 10
+EOF
+    fi
+
+    chmod 700 "$ssh_dir"
+    chmod 600 "$ssh_config"
+
+    log "SSH config updated for gpuws-linux"
+    if [ -n "$CF_HOSTNAME_WIN" ] && [ -n "$WINDOWS_USER" ]; then
+        log "SSH config updated for gpuws-windows"
+    fi
+}
+
+print_linux_failure() {
+    echo ""
+    echo "SSH test failed for gpuws-linux."
+    echo ""
+    echo "Check the following:"
+    echo "  1. Confirm your private key path in ~/.config/gpuws/client.json"
+    echo "  2. Confirm the matching private key exists on this machine"
+    echo "  3. Confirm the matching public key was added on the host"
+    echo "  4. Confirm cloudflared is installed and authenticated"
+    echo "  5. Confirm the host tunnel/service is running"
+    echo "  6. Check the gpuws-linux entry in ~/.ssh/config"
+    echo ""
+    echo "Try:"
+    echo "  ssh gpuws-linux"
+    echo "  ssh -v gpuws-linux"
+    echo ""
+}
+
+print_windows_warning() {
+    echo ""
+    echo "Warning: SSH test failed for gpuws-windows."
+    echo "Linux access works, so client setup is still usable."
+    echo ""
+    echo "If you need Windows host access, check:"
+    echo "  1. IdentityFile path"
+    echo "  2. Matching key on the host"
+    echo "  3. cloudflared authentication"
+    echo "  4. Host tunnel/service status"
+    echo ""
+    echo "Try:"
+    echo "  ssh gpuws-windows"
+    echo "  ssh -v gpuws-windows"
+    echo ""
+}
+
+print_success() {
+    echo ""
+    echo "Client setup complete."
+    echo "You are ready to connect."
+    echo ""
+    echo "Files written:"
+    echo "  ~/.config/gpuws/client.json"
+    echo "  ~/.ssh/config"
+    echo ""
+    echo "Quick test:"
+    echo "  ssh gpuws-linux"
+    echo ""
+}
+
+test_linux_ssh() {
+    log "Testing connection to gpuws-linux..."
+
+    if ssh -o BatchMode=yes -o ConnectTimeout=10 gpuws-linux echo GPUWS_OK >/dev/null 2>&1; then
+        log "Connection to gpuws-linux verified"
+        return 0
+    fi
+
+    print_linux_failure
+    exit 1
+}
+
+test_windows_ssh() {
+    if [ -z "$CF_HOSTNAME_WIN" ] || [ -z "$WINDOWS_USER" ]; then
+        return 0
+    fi
+
+    log "Testing connection to gpuws-windows..."
+
+    if ssh -o BatchMode=yes -o ConnectTimeout=10 gpuws-windows echo GPUWS_OK >/dev/null 2>&1; then
+        log "Connection to gpuws-windows verified"
+        return 0
+    fi
+
+    print_windows_warning
+    return 0
+}
+
+main() {
+    echo ""
+    echo "GPUWS client installer"
+    echo ""
+
+    ensure_cloudflared
+    ensure_cloudflared_symlink
+    confirm_identity_file
+    write_client_config
+    update_ssh_config
+    test_linux_ssh
+    test_windows_ssh
+    print_success
+}
+
+main "$@"
