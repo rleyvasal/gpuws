@@ -70,7 +70,27 @@ if value is None:
 print(value)
 PY
 }
+validate_ssh_public_key_format() {
+    local key="$1"
+    local key_type
+    local key_blob
 
+    key_type="$(printf '%s' "$key" | awk '{print $1}')"
+    key_blob="$(printf '%s' "$key" | awk '{print $2}')"
+
+    [ -n "$key_type" ] || return 1
+    [ -n "$key_blob" ] || return 1
+
+    case "$key_type" in
+        ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    printf '%s' "$key_blob" | grep -Eq '^[A-Za-z0-9+/=]+$'
+}
 write_host_config() {
     mkdir -p "$(dirname "$HOST_CONFIG_FILE")"
 
@@ -209,9 +229,9 @@ prompt_for_missing_values() {
     read -r -p "Tunnel name [$CF_TUNNEL]: " _TUN
     CF_TUNNEL="${_TUN:-$CF_TUNNEL}"
 }
-
 validate_required_values() {
     [ -n "${SSH_PUBLIC_KEY:-}" ] || fail "GPUWS requires an SSH public key"
+    validate_ssh_public_key_format "$SSH_PUBLIC_KEY" || fail "Invalid SSH public key format"
     [ -n "${CF_DOMAIN:-}" ] || fail "GPUWS requires a Cloudflare domain"
     [ -n "${CF_TUNNEL:-}" ] || fail "GPUWS requires a Cloudflare tunnel name"
 
@@ -449,6 +469,14 @@ else
 fi
 
 step "GPUWS Step 4: Add SSH key"
+tmp_key="$(mktemp)"
+printf '%s\n' "$SSH_PUBLIC_KEY" > "$tmp_key"
+ssh-keygen -l -f "$tmp_key" >/dev/null 2>&1 || {
+    rm -f "$tmp_key"
+    fail "Invalid SSH public key"
+}
+rm -f "$tmp_key"
+
 mkdir -p "$HOME/.ssh"
 touch "$HOME/.ssh/authorized_keys"
 grep -qxF "$SSH_PUBLIC_KEY" "$HOME/.ssh/authorized_keys" || echo "$SSH_PUBLIC_KEY" >> "$HOME/.ssh/authorized_keys"
