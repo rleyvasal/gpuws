@@ -66,10 +66,75 @@ function Test-RebootRequired {
     return $false
 }
 
+function Test-SshPublicKeyFormat {
+    param([string]$Key)
+
+    if ([string]::IsNullOrWhiteSpace($Key)) { return $false }
+
+    $parts = $Key.Trim() -split '\s+'
+    if ($parts.Count -lt 2) { return $false }
+
+    $allowed = @(
+        'ssh-ed25519',
+        'ssh-rsa',
+        'ecdsa-sha2-nistp256',
+        'ecdsa-sha2-nistp384',
+        'ecdsa-sha2-nistp521'
+    )
+
+    if ($allowed -notcontains $parts[0]) { return $false }
+    if ($parts[1] -notmatch '^[A-Za-z0-9+/=]+$') { return $false }
+
+    return $true
+}
+
+function Test-PortInUseByOtherProcess {
+    param([int]$Port)
+
+    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if (-not $listeners) { return $false }
+
+    foreach ($listener in $listeners) {
+        $proc = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+        if ($proc -and $proc.ProcessName -ne 'sshd') {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-AvailableWindowsSshPort {
+    param([int]$InitialPort)
+
+    $port = $InitialPort
+
+    while (Test-PortInUseByOtherProcess -Port $port) {
+        Write-Host "Port $port is already in use by another process." -ForegroundColor Yellow
+        $newPort = Read-Host "Choose a different Windows SSH port"
+        if ([string]::IsNullOrWhiteSpace($newPort)) { continue }
+
+        $parsed = 0
+        if (-not [int]::TryParse($newPort, [ref]$parsed)) {
+            Write-Host "Please enter a valid numeric port." -ForegroundColor Yellow
+            continue
+        }
+
+        $port = $parsed
+    }
+
+    return $port
+}
+
 $SETUP_LINUX_URL = "https://raw.githubusercontent.com/rleyvasal/gpuws/main/linux-setup.sh"
 
-Write-Host "=== GPUWS Windows Host Setup ===" -ForegroundColor Cyan
-Write-Host "Press Enter to accept defaults or enter different values." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "=== GPUWS PRE-FLIGHT CHECKLIST ===" -ForegroundColor Yellow
+Write-Host "  1. This script prepares the Windows side for a GPUWS host using WSL." -ForegroundColor Yellow
+Write-Host "  2. The admin SSH public key you provide is for initial host access." -ForegroundColor Yellow
+Write-Host "  3. Managed GPUWS clients are added later from Linux using 'gpuws client add'." -ForegroundColor Yellow
+Write-Host "  4. Linux setup inside WSL will handle the GPUWS runtime and Cloudflare tunnel." -ForegroundColor Yellow
+Pause
 
 $WINDOWS_USER = $env:USERNAME
 $WINDOWS_HOME = $env:USERPROFILE
@@ -113,16 +178,33 @@ if (-not $LINUX_SSH_PORT) {
 if (-not $WINDOWS_SSH_PORT) {
     $WINDOWS_SSH_PORT = Read-HostDefault "Windows SSH port" "22"
 }
+
+$WINDOWS_SSH_PORT = Get-AvailableWindowsSshPort -InitialPort ([int]$WINDOWS_SSH_PORT)
+
 if (-not $SSH_PUBLIC_KEY) {
-    Write-Host ""
-    Write-Host "Paste your SSH public key:" -ForegroundColor Yellow
-    $SSH_PUBLIC_KEY = Read-Host "SSH public key"
+    while ($true) {
+        Write-Host ""
+        Write-Host "Paste the admin SSH public key from the machine you will use to access this GPU host." -ForegroundColor Yellow
+        Write-Host "This grants initial SSH access to the host." -ForegroundColor Yellow
+        Write-Host "Example source: ~/.ssh/id_ed25519.pub on your laptop or client machine." -ForegroundColor Yellow
+        $SSH_PUBLIC_KEY = Read-Host "Admin SSH public key"
+
+        if (Test-SshPublicKeyFormat $SSH_PUBLIC_KEY) { break }
+
+        Write-Host "Invalid admin SSH public key. Please paste a valid public key from the client machine you will use to access this host." -ForegroundColor Red
+        $SSH_PUBLIC_KEY = $null
+    }
 }
+
 if (-not $CF_DOMAIN) {
     $CF_DOMAIN = Read-Host "Cloudflare domain"
 }
 if (-not $CF_TUNNEL) {
     $CF_TUNNEL = Read-HostDefault "Tunnel name" "gpuws"
+}
+
+if (-not (Test-SshPublicKeyFormat $SSH_PUBLIC_KEY)) {
+    throw "Invalid admin SSH public key"
 }
 
 if (-not (Test-Path $GPUWS_DIR)) {
@@ -254,7 +336,10 @@ Match Group administrators
     Restart-Service sshd
 }
 
-Run-Step "GPUWS Step 3: Add SSH key" {
+Run-Step "GPUWS Step 3: Authorize admin SSH key" {
+    if (-not (Test-SshPublicKeyFormat $SSH_PUBLIC_KEY)) {
+    throw "Invalid admin SSH public key"
+    }
     $adminKeyFile = "C:\ProgramData\ssh\administrators_authorized_keys"
     if (-not (Test-Path "C:\ProgramData\ssh")) {
         New-Item -ItemType Directory -Path "C:\ProgramData\ssh" | Out-Null
@@ -325,6 +410,8 @@ Run-Step "GPUWS Step 6: Copy bootstrap config into WSL" {
 Write-Host ""
 Write-Host "GPUWS Windows side is ready." -ForegroundColor Green
 Write-Host "Bootstrap copied into WSL." -ForegroundColor Green
+Write-Host "Admin SSH key saved for initial host access." -ForegroundColor Green
+Write-Host "Managed GPUWS clients are added later from Linux using 'gpuws client add'." -ForegroundColor Green
 Write-Host ""
 Write-Host "Next step inside WSL:" -ForegroundColor Cyan
 Write-Host "  curl -fsSL '$SETUP_LINUX_URL' -o /tmp/linux-setup.sh && bash /tmp/linux-setup.sh" -ForegroundColor White
