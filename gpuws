@@ -1,0 +1,596 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST_CONFIG="$HOME/.config/gpuws/host.json"
+CLIENTS_CONFIG="$HOME/.config/gpuws/clients.json"
+TEMPLATE_DIR="$HOME/.config/gpuws/templates"
+CLIENT_TEMPLATE="$TEMPLATE_DIR/client-setup.sh"
+GENERATED_DIR="$HOME/.config/gpuws/generated"
+AUTHORIZED_KEYS="$HOME/.ssh/authorized_keys"
+KERNEL_MANAGER="$HOME/bin/kernel-manager.sh"
+
+log() {
+    echo "$*"
+}
+
+warn() {
+    echo "Warning: $*" >&2
+}
+
+fail() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
+
+require_file() {
+    [ -f "$1" ] || fail "Required file not found: $1"
+}
+
+validate_json_file() {
+    local file="$1"
+    local filter="$2"
+
+    [ -f "$file" ] || fail "Required file not found: $file"
+    jq -e "$filter" "$file" >/dev/null || fail "Invalid JSON structure in $file"
+}
+
+validate_gpuws_config() {
+    validate_json_file "$HOST_CONFIG" '
+        .host_type and
+        .linux_user and
+        .linux_ssh_port and
+        .cf_hostname_linux and
+        .default_root_dir and
+        .venv_path
+    '
+
+    validate_json_file "$CLIENTS_CONFIG" '
+        .clients and (.clients | type == "array")
+    '
+}
+
+require_gpuws_host() {
+    require_cmd jq
+    require_file "$HOST_CONFIG"
+    require_file "$CLIENTS_CONFIG"
+    require_file "$CLIENT_TEMPLATE"
+    require_file "$KERNEL_MANAGER"
+    validate_gpuws_config
+    mkdir -p "$GENERATED_DIR"
+    mkdir -p "$(dirname "$AUTHORIZED_KEYS")"
+    touch "$AUTHORIZED_KEYS"
+}
+
+normalize_name() {
+    printf '%s' "$1" \
+      | tr '[:upper:]' '[:lower:]' \
+      | sed -E 's/[[:space:]]+/_/g; s/[^a-z0-9_-]+/_/g; s/_+/_/g; s/^_+//; s/_+$//'
+}
+
+validate_public_key() {
+    local key="$1"
+    local key_type
+    local key_blob
+
+    key_type="$(printf '%s' "$key" | awk '{print $1}')"
+    key_blob="$(printf '%s' "$key" | awk '{print $2}')"
+
+    [ -n "$key_type" ] || return 1
+    [ -n "$key_blob" ] || return 1
+
+    case "$key_type" in
+        ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+extract_key_comment() {
+    printf '%s' "$1" | awk '{print ($3 ? $3 : "")}'
+}
+
+timestamp_utc() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+escape_sed_replacement() {
+    printf '%s' "$1" | sed -e 's/[&|]/\\&/g'
+}
+
+host_get() {
+    local field="$1"
+    jq -r --arg field "$field" '.[$field] // ""' "$HOST_CONFIG"
+}
+
+client_exists_by_name() {
+    local name="$1"
+    jq -e --arg name "$name" '.clients[] | select(.name == $name)' "$CLIENTS_CONFIG" >/dev/null
+}
+
+client_exists_by_key() {
+    local public_key="$1"
+    jq -e --arg key "$public_key" '.clients[] | select(.public_key == $key)' "$CLIENTS_CONFIG" >/dev/null
+}
+
+get_client_field() {
+    local name="$1"
+    local field="$2"
+    jq -r --arg name "$name" --arg field "$field" '
+        .clients[]
+        | select(.name == $name)
+        | .[$field] // ""
+    ' "$CLIENTS_CONFIG"
+}
+
+get_client_name_by_key() {
+    local public_key="$1"
+    jq -r --arg key "$public_key" '
+        .clients[]
+        | select(.public_key == $key)
+        | .name
+    ' "$CLIENTS_CONFIG"
+}
+
+client_count() {
+    jq '.clients | length' "$CLIENTS_CONFIG"
+}
+
+write_clients_add() {
+    local name="$1"
+    local default_name="$2"
+    local work_dir="$3"
+    local public_key="$4"
+    local key_comment="$5"
+    local added_at="$6"
+    local tmp
+
+    tmp="$(mktemp)"
+
+    jq \
+      --arg name "$name" \
+      --arg default_name "$default_name" \
+      --arg work_dir "$work_dir" \
+      --arg public_key "$public_key" \
+      --arg key_comment "$key_comment" \
+      --arg added_at "$added_at" \
+      '
+      .clients |= map(select(.name != $name))
+      | .clients += [{
+          name: $name,
+          default_name: $default_name,
+          work_dir: $work_dir,
+          public_key: $public_key,
+          key_comment: $key_comment,
+          added_at: $added_at
+        }]
+      | .clients |= sort_by(.name)
+      ' "$CLIENTS_CONFIG" > "$tmp"
+
+    mv "$tmp" "$CLIENTS_CONFIG"
+    chmod 600 "$CLIENTS_CONFIG"
+}
+
+write_clients_remove() {
+    local name="$1"
+    local tmp
+
+    tmp="$(mktemp)"
+
+    jq --arg name "$name" '
+      .clients |= map(select(.name != $name))
+    ' "$CLIENTS_CONFIG" > "$tmp"
+
+    mv "$tmp" "$CLIENTS_CONFIG"
+    chmod 600 "$CLIENTS_CONFIG"
+}
+
+ensure_authorized_key() {
+    local public_key="$1"
+
+    mkdir -p "$(dirname "$AUTHORIZED_KEYS")"
+    touch "$AUTHORIZED_KEYS"
+
+    if ! grep -qxF "$public_key" "$AUTHORIZED_KEYS"; then
+        echo "$public_key" >> "$AUTHORIZED_KEYS"
+    fi
+
+    chmod 700 "$(dirname "$AUTHORIZED_KEYS")"
+    chmod 600 "$AUTHORIZED_KEYS"
+}
+
+remove_authorized_key() {
+    local public_key="$1"
+    local tmp
+
+    tmp="$(mktemp)"
+    grep -vxF "$public_key" "$AUTHORIZED_KEYS" > "$tmp" || true
+    mv "$tmp" "$AUTHORIZED_KEYS"
+    chmod 600 "$AUTHORIZED_KEYS"
+}
+
+ensure_work_dir() {
+    local work_dir="$1"
+    mkdir -p "$work_dir"
+}
+
+remove_work_dir() {
+    local work_dir="$1"
+    local default_root_dir="$2"
+
+    [ -n "$work_dir" ] || fail "Refusing to remove empty work_dir"
+    [ -n "$default_root_dir" ] || fail "Refusing to remove without default_root_dir"
+    [ "$work_dir" != "/" ] || fail "Refusing to remove root directory"
+
+    case "$work_dir" in
+        "$default_root_dir"/*)
+            [ -d "$work_dir" ] && rm -rf "$work_dir"
+            ;;
+        *)
+            fail "Refusing to remove work_dir outside GPUWS root: $work_dir"
+            ;;
+    esac
+}
+
+ensure_kernel() {
+    local default_name="$1"
+    local venv_path="$2"
+    local work_dir="$3"
+
+    "$KERNEL_MANAGER" create "$default_name" "$venv_path/bin/python" "$work_dir"
+}
+
+remove_kernel() {
+    local default_name="$1"
+    "$KERNEL_MANAGER" delete "$default_name"
+}
+
+render_client_installer() {
+    local linux_user="$1"
+    local windows_user="$2"
+    local linux_ssh_port="$3"
+    local windows_ssh_port="$4"
+    local cf_hostname_linux="$5"
+    local cf_hostname_win="$6"
+    local default_name="$7"
+    local work_dir="$8"
+    local venv_path="$9"
+    local output_path="${10}"
+
+    local tmp
+    local linux_user_esc
+    local windows_user_esc
+    local linux_ssh_port_esc
+    local windows_ssh_port_esc
+    local cf_hostname_linux_esc
+    local cf_hostname_win_esc
+    local default_name_esc
+    local work_dir_esc
+    local venv_path_esc
+
+    mkdir -p "$GENERATED_DIR"
+
+    linux_user_esc="$(escape_sed_replacement "$linux_user")"
+    windows_user_esc="$(escape_sed_replacement "$windows_user")"
+    linux_ssh_port_esc="$(escape_sed_replacement "$linux_ssh_port")"
+    windows_ssh_port_esc="$(escape_sed_replacement "$windows_ssh_port")"
+    cf_hostname_linux_esc="$(escape_sed_replacement "$cf_hostname_linux")"
+    cf_hostname_win_esc="$(escape_sed_replacement "$cf_hostname_win")"
+    default_name_esc="$(escape_sed_replacement "$default_name")"
+    work_dir_esc="$(escape_sed_replacement "$work_dir")"
+    venv_path_esc="$(escape_sed_replacement "$venv_path")"
+
+    tmp="$(mktemp)"
+    cp "$CLIENT_TEMPLATE" "$tmp"
+
+    sed \
+      -e "s|__LINUX_USER__|$linux_user_esc|g" \
+      -e "s|__WINDOWS_USER__|$windows_user_esc|g" \
+      -e "s|__LINUX_SSH_PORT__|$linux_ssh_port_esc|g" \
+      -e "s|__WINDOWS_SSH_PORT__|$windows_ssh_port_esc|g" \
+      -e "s|__CF_HOSTNAME_LINUX__|$cf_hostname_linux_esc|g" \
+      -e "s|__CF_HOSTNAME_WIN__|$cf_hostname_win_esc|g" \
+      -e "s|__DEFAULT_NAME__|$default_name_esc|g" \
+      -e "s|__WORK_DIR__|$work_dir_esc|g" \
+      -e "s|__VENV_PATH__|$venv_path_esc|g" \
+      "$tmp" > "$output_path"
+
+    rm -f "$tmp"
+    chmod 700 "$output_path"
+}
+
+cmd_host_status() {
+    require_cmd jq
+
+    local host_type=""
+    local linux_user=""
+    local windows_user=""
+    local linux_ssh_port=""
+    local windows_ssh_port=""
+    local cf_hostname_linux=""
+    local cf_hostname_win=""
+    local default_root_dir=""
+    local venv_path=""
+    local clients_count="0"
+
+    if [ -f "$HOST_CONFIG" ]; then
+        host_type="$(host_get host_type)"
+        linux_user="$(host_get linux_user)"
+        windows_user="$(host_get windows_user)"
+        linux_ssh_port="$(host_get linux_ssh_port)"
+        windows_ssh_port="$(host_get windows_ssh_port)"
+        cf_hostname_linux="$(host_get cf_hostname_linux)"
+        cf_hostname_win="$(host_get cf_hostname_win)"
+        default_root_dir="$(host_get default_root_dir)"
+        venv_path="$(host_get venv_path)"
+    fi
+
+    if [ -f "$CLIENTS_CONFIG" ]; then
+        clients_count="$(client_count)"
+    fi
+
+    echo "GPUWS Host Status"
+    echo ""
+
+    [ -n "$host_type" ] && echo "Host type: $host_type"
+    [ -n "$linux_user" ] && echo "Linux user: $linux_user"
+    [ -n "$cf_hostname_linux" ] && [ -n "$linux_ssh_port" ] && echo "Linux SSH: $cf_hostname_linux:$linux_ssh_port"
+    [ -n "$cf_hostname_win" ] && [ -n "$windows_user" ] && [ -n "$windows_ssh_port" ] && echo "Windows SSH: $cf_hostname_win:$windows_ssh_port"
+    [ -n "$default_root_dir" ] && echo "Root dir: $default_root_dir"
+    [ -n "$venv_path" ] && echo "Venv: $venv_path"
+    echo "Clients registered: $clients_count"
+    echo ""
+
+    [ -f "$HOST_CONFIG" ] && echo "host.json: OK" || echo "host.json: MISSING"
+    [ -f "$CLIENTS_CONFIG" ] && echo "clients.json: OK" || echo "clients.json: MISSING"
+    [ -f "$KERNEL_MANAGER" ] && echo "kernel-manager.sh: OK" || echo "kernel-manager.sh: MISSING"
+    [ -f "$CLIENT_TEMPLATE" ] && echo "client template: OK" || echo "client template: MISSING"
+    [ -n "$venv_path" ] && [ -x "$venv_path/bin/python" ] && echo "shared venv: OK" || echo "shared venv: MISSING"
+    command -v cloudflared >/dev/null 2>&1 && echo "cloudflared: OK" || echo "cloudflared: MISSING"
+    command -v sshd >/dev/null 2>&1 && echo "sshd: OK" || echo "sshd: MISSING"
+    [ -f "$HOME/.cloudflared/config.yml" ] && echo "cloudflared config: OK" || echo "cloudflared config: MISSING"
+}
+
+cmd_client_list() {
+    require_gpuws_host
+
+    if [ "$(client_count)" -eq 0 ]; then
+        echo "No GPUWS clients registered"
+        return 0
+    fi
+
+    echo "GPUWS Clients"
+    echo ""
+
+    printf "%-20s %-40s %-10s %s\n" "NAME" "WORK_DIR" "INSTALLER" "ADDED_AT"
+
+    jq -r '.clients[] | [.name, .work_dir, .added_at] | @tsv' "$CLIENTS_CONFIG" |
+    while IFS=$'\t' read -r name work_dir added_at; do
+        local installer="no"
+        [ -f "$GENERATED_DIR/${name}-install.sh" ] && installer="yes"
+        printf "%-20s %-40s %-10s %s\n" "$name" "$work_dir" "$installer" "$added_at"
+    done
+}
+
+cmd_client_add() {
+    require_gpuws_host
+
+    local raw_name=""
+    local client_name=""
+    local public_key=""
+    local key_comment=""
+    local existing_name_by_key=""
+    local existing_key_for_name=""
+    local linux_user=""
+    local windows_user=""
+    local linux_ssh_port=""
+    local windows_ssh_port=""
+    local cf_hostname_linux=""
+    local cf_hostname_win=""
+    local venv_path=""
+    local default_root_dir=""
+    local default_name=""
+    local work_dir=""
+    local installer_path=""
+    local added_at=""
+    local is_refresh="false"
+
+    read -r -p "Client name: " raw_name
+    [ -n "$raw_name" ] || fail "Client name is required"
+
+    client_name="$(normalize_name "$raw_name")"
+    [ -n "$client_name" ] || fail "Client name is invalid after normalization"
+
+    read -r -p "SSH public key: " public_key
+    [ -n "$public_key" ] || fail "SSH public key is required"
+    validate_public_key "$public_key" || fail "Invalid SSH public key format"
+
+    key_comment="$(extract_key_comment "$public_key")"
+
+    if client_exists_by_name "$client_name"; then
+        existing_key_for_name="$(get_client_field "$client_name" public_key)"
+        if [ "$existing_key_for_name" != "$public_key" ]; then
+            fail "Client name '$client_name' already exists. Choose a different name."
+        fi
+        is_refresh="true"
+    fi
+
+    if client_exists_by_key "$public_key"; then
+        existing_name_by_key="$(get_client_name_by_key "$public_key")"
+        if [ "$existing_name_by_key" != "$client_name" ]; then
+            fail "This SSH public key is already registered to client '$existing_name_by_key'."
+        fi
+    fi
+
+    linux_user="$(host_get linux_user)"
+    windows_user="$(host_get windows_user)"
+    linux_ssh_port="$(host_get linux_ssh_port)"
+    windows_ssh_port="$(host_get windows_ssh_port)"
+    cf_hostname_linux="$(host_get cf_hostname_linux)"
+    cf_hostname_win="$(host_get cf_hostname_win)"
+    venv_path="$(host_get venv_path)"
+    default_root_dir="$(host_get default_root_dir)"
+
+    default_name="$client_name"
+    work_dir="$default_root_dir/$client_name"
+    installer_path="$GENERATED_DIR/${client_name}-install.sh"
+
+    ensure_authorized_key "$public_key"
+    ensure_work_dir "$work_dir"
+    ensure_kernel "$default_name" "$venv_path" "$work_dir"
+
+    if [ "$is_refresh" = "true" ]; then
+        added_at="$(get_client_field "$client_name" added_at)"
+        [ -n "$added_at" ] || added_at="$(timestamp_utc)"
+    else
+        added_at="$(timestamp_utc)"
+    fi
+
+    write_clients_add \
+        "$client_name" \
+        "$default_name" \
+        "$work_dir" \
+        "$public_key" \
+        "$key_comment" \
+        "$added_at"
+
+    render_client_installer \
+        "$linux_user" \
+        "$windows_user" \
+        "$linux_ssh_port" \
+        "$windows_ssh_port" \
+        "$cf_hostname_linux" \
+        "$cf_hostname_win" \
+        "$default_name" \
+        "$work_dir" \
+        "$venv_path" \
+        "$installer_path"
+
+    if [ "$is_refresh" = "true" ]; then
+        echo "Client '$client_name' already exists"
+        echo "Kernel verified"
+        echo "Installer regenerated at: $installer_path"
+    else
+        echo "Added client '$client_name'"
+        echo "Kernel created or verified"
+        echo "Installer generated at: $installer_path"
+    fi
+}
+cmd_client_remove() {
+    require_gpuws_host
+
+    local raw_name="${1:-}"
+    local client_name=""
+    local confirm_flag="${2:-}"
+    local public_key=""
+    local work_dir=""
+    local default_name=""
+    local default_root_dir=""
+
+    [ -n "$raw_name" ] || fail "Usage: gpuws client remove <name> [--yes]"
+
+    client_name="$(normalize_name "$raw_name")"
+    [ -n "$client_name" ] || fail "Client name is invalid after normalization"
+
+    if ! client_exists_by_name "$client_name"; then
+        fail "Client '$client_name' not found"
+    fi
+
+    public_key="$(get_client_field "$client_name" public_key)"
+    work_dir="$(get_client_field "$client_name" work_dir)"
+    default_name="$(get_client_field "$client_name" default_name)"
+    default_root_dir="$(host_get default_root_dir)"
+
+    echo "This will remove:"
+    echo "  Client record: $client_name"
+    echo "  SSH key from ~/.ssh/authorized_keys"
+    echo "  Kernel: $default_name"
+    echo "  Work directory: $work_dir"
+    echo "  Installer: $GENERATED_DIR/${client_name}-install.sh"
+    echo ""
+
+    if [ "$confirm_flag" != "--yes" ]; then
+        read -r -p "Continue? [y/N]: " reply
+        case "$reply" in
+            y|Y|yes|YES) ;;
+            *)
+                echo "Aborted"
+                echo "No changes were made."
+                return 0
+                ;;
+        esac
+    fi
+
+    [ -f "$GENERATED_DIR/${client_name}-install.sh" ] && rm -f "$GENERATED_DIR/${client_name}-install.sh"
+    remove_kernel "$default_name"
+    remove_work_dir "$work_dir" "$default_root_dir"
+    remove_authorized_key "$public_key"
+    write_clients_remove "$client_name"
+
+    echo "Removed client '$client_name'"
+    echo "Kernel deleted"
+    echo "Work directory removed"
+    echo "SSH key removed"
+    echo "Installer removed"
+    echo "Client registry updated"
+}
+
+usage() {
+    cat <<EOF
+GPUWS host command
+
+Usage:
+  gpuws host status
+  gpuws client list
+  gpuws client add
+  gpuws client remove <name> [--yes]
+EOF
+}
+
+main() {
+    case "${1:-}" in
+        host)
+            case "${2:-}" in
+                status)
+                    cmd_host_status
+                    ;;
+                *)
+                    usage
+                    exit 1
+                    ;;
+            esac
+            ;;
+        client)
+            case "${2:-}" in
+                list)
+                    cmd_client_list
+                    ;;
+                add)
+                    cmd_client_add
+                    ;;
+                remove)
+                    cmd_client_remove "${3:-}" "${4:-}"
+                    ;;
+                *)
+                    usage
+                    exit 1
+                    ;;
+            esac
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

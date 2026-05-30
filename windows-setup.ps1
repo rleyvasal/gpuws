@@ -66,12 +66,13 @@ function Test-RebootRequired {
     return $false
 }
 
+$SETUP_LINUX_URL = "https://raw.githubusercontent.com/rleyvasal/gpuws/main/linux-setup.sh"
+
 Write-Host "=== GPUWS Windows Host Setup ===" -ForegroundColor Cyan
 Write-Host "Press Enter to accept defaults or enter different values." -ForegroundColor Yellow
 
 $WINDOWS_USER = $env:USERNAME
 $WINDOWS_HOME = $env:USERPROFILE
-$COMPUTER_NAME = $env:COMPUTERNAME
 
 $GPUWS_DIR = Join-Path $WINDOWS_HOME ".config\gpuws"
 $BOOTSTRAP_FILE = Join-Path $GPUWS_DIR "bootstrap.json"
@@ -128,7 +129,7 @@ if (-not (Test-Path $GPUWS_DIR)) {
     New-Item -ItemType Directory -Path $GPUWS_DIR -Force | Out-Null
 }
 
-@{
+$bootstrapObject = @{
     host_type        = "windows-wsl"
     windows_user     = $WINDOWS_USER
     wsl_distro       = $WSL_DISTRO
@@ -137,12 +138,15 @@ if (-not (Test-Path $GPUWS_DIR)) {
     ssh_public_key   = $SSH_PUBLIC_KEY
     cf_domain        = $CF_DOMAIN
     cf_tunnel        = $CF_TUNNEL
-} | ConvertTo-Json -Depth 3 | Set-Content $BOOTSTRAP_FILE
+}
+$bootstrapJson = $bootstrapObject | ConvertTo-Json -Depth 3
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($BOOTSTRAP_FILE, $bootstrapJson, $utf8NoBom)
 
 Write-Host ""
-Write-Host "Bootstrap config saved to $BOOTSTRAP_FILE" -ForegroundColor Green
+Write-Host "GPUWS bootstrap config saved to $BOOTSTRAP_FILE" -ForegroundColor Green
 
-Run-Step "Step 1: Install WSL + distro" {
+Run-Step "GPUWS Step 1: Install WSL and distro" {
     $distroInstalled = $false
     $output = wsl --list --quiet 2>$null
     if ($LASTEXITCODE -eq 0 -and $output) {
@@ -169,8 +173,7 @@ Run-Step "Step 1: Install WSL + distro" {
         Write-Host "$WSL_DISTRO already installed, skipping." -ForegroundColor Green
     }
 }
-
-Run-Step "Step 2: Install and configure OpenSSH" {
+Run-Step "GPUWS Step 2: Install and configure OpenSSH" {
     $sshState = "Unknown"
     try {
         $sshState = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Select-Object -ExpandProperty State
@@ -187,21 +190,71 @@ Run-Step "Step 2: Install and configure OpenSSH" {
     ssh-keygen -A
 
     $sshdConfig = "C:\ProgramData\ssh\sshd_config"
-    $requiredSettings = @"
-Port $WINDOWS_SSH_PORT
-PubkeyAuthentication yes
-PasswordAuthentication no
+    $backupConfig = "C:\ProgramData\ssh\sshd_config.gpuws.bak"
+
+    if (-not (Test-Path $sshdConfig)) {
+        New-Item -ItemType File -Path $sshdConfig -Force | Out-Null
+    }
+
+    if (-not (Test-Path $backupConfig)) {
+        Copy-Item $sshdConfig $backupConfig -Force
+        Write-Host "Backed up sshd_config to $backupConfig" -ForegroundColor Yellow
+    }
+
+    $lines = Get-Content $sshdConfig -ErrorAction SilentlyContinue
+    if (-not $lines) { $lines = @() }
+
+    function Set-Or-AppendLine {
+        param(
+            [string[]]$InputLines,
+            [string]$Pattern,
+            [string]$Replacement
+        )
+
+        $found = $false
+        $result = foreach ($line in $InputLines) {
+            if ($line -match $Pattern) {
+                $found = $true
+                $Replacement
+            } else {
+                $line
+            }
+        }
+
+        if (-not $found) {
+            $result += $Replacement
+        }
+
+        return ,$result
+    }
+
+    $lines = Set-Or-AppendLine -InputLines $lines -Pattern '^\s*#?\s*Port\s+' -Replacement "Port $WINDOWS_SSH_PORT"
+    $lines = Set-Or-AppendLine -InputLines $lines -Pattern '^\s*#?\s*PubkeyAuthentication\s+' -Replacement "PubkeyAuthentication yes"
+    $lines = Set-Or-AppendLine -InputLines $lines -Pattern '^\s*#?\s*PasswordAuthentication\s+' -Replacement "PasswordAuthentication no"
+
+    $content = ($lines -join "`n").TrimEnd()
+
+    $content = [regex]::Replace(
+        $content,
+        '(?ms)^\s*Match Group administrators\s*\r?\n\s*AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys\s*',
+        ''
+    ).TrimEnd()
+
+    $adminBlock = @"
+
 Match Group administrators
        AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
 "@
-    Set-Content $sshdConfig $requiredSettings
+
+    $content = ($content + $adminBlock).Trim() + "`r`n"
+    Set-Content -Path $sshdConfig -Value $content
 
     Set-Service -Name sshd -StartupType Automatic
     Start-Service sshd
     Restart-Service sshd
 }
 
-Run-Step "Step 3: Add SSH key" {
+Run-Step "GPUWS Step 3: Add SSH key" {
     $adminKeyFile = "C:\ProgramData\ssh\administrators_authorized_keys"
     if (-not (Test-Path "C:\ProgramData\ssh")) {
         New-Item -ItemType Directory -Path "C:\ProgramData\ssh" | Out-Null
@@ -215,7 +268,7 @@ Run-Step "Step 3: Add SSH key" {
     icacls $adminKeyFile /inheritance:r /grant "SYSTEM:F" /grant "Administrators:F" | Out-Null
 }
 
-Run-Step "Step 4: Firewall rules" {
+Run-Step "GPUWS Step 4: Configure firewall" {
     $rules = @(
         @{ Name="GPUWS OpenSSH Inbound"; Port=$WINDOWS_SSH_PORT; Remote="Any" },
         @{ Name="GPUWS Linux SSH Inbound"; Port=$LINUX_SSH_PORT; Remote="Any" }
@@ -229,7 +282,7 @@ Run-Step "Step 4: Firewall rules" {
     }
 }
 
-Run-Step "Step 5: Disable sleep and WSL idle timeout" {
+Run-Step "GPUWS Step 5: Disable sleep and WSL idle timeout" {
     powercfg /change standby-timeout-ac 0
     powercfg /change standby-timeout-dc 0
     powercfg /change hibernate-timeout-ac 0
@@ -251,7 +304,7 @@ $WSL_USER = Get-DetectedLinuxUser -Distro $WSL_DISTRO
 
 if ($needsReboot) {
     Write-Host ""
-    Write-Host "WSL setup appears to require a reboot before Linux handoff." -ForegroundColor Yellow
+    Write-Host "GPUWS note: WSL setup appears to require a reboot before Linux handoff." -ForegroundColor Yellow
 }
 
 if (-not $WSL_USER) {
@@ -260,19 +313,21 @@ if (-not $WSL_USER) {
     Write-Host "Launch the distro once, create your Linux user, then continue with:" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "wsl -d $WSL_DISTRO -- bash -lc `"mkdir -p ~/.config/gpuws && cp /mnt/c/Users/$WINDOWS_USER/.config/gpuws/bootstrap.json ~/.config/gpuws/bootstrap.json && chmod 600 ~/.config/gpuws/bootstrap.json`"" -ForegroundColor Cyan
-    Write-Host "wsl -d $WSL_DISTRO -- bash -lc `"curl -fsSL <SETUP_LINUX_URL> -o /tmp/setup-linux.sh && bash /tmp/setup-linux.sh`"" -ForegroundColor Cyan
+    Write-Host "wsl -d $WSL_DISTRO -- bash -lc `"curl -fsSL '$SETUP_LINUX_URL' -o /tmp/linux-setup.sh && bash /tmp/linux-setup.sh`"" -ForegroundColor Cyan
     Pause
     exit 0
 }
 
-Run-Step "Step 6: Copy bootstrap config into WSL" {
+Run-Step "GPUWS Step 6: Copy bootstrap config into WSL" {
     wsl -d $WSL_DISTRO -u $WSL_USER -- bash -lc "mkdir -p ~/.config/gpuws && cp /mnt/c/Users/$WINDOWS_USER/.config/gpuws/bootstrap.json ~/.config/gpuws/bootstrap.json && chmod 600 ~/.config/gpuws/bootstrap.json"
 }
 
 Write-Host ""
-Write-Host "Windows side is ready." -ForegroundColor Green
+Write-Host "GPUWS Windows side is ready." -ForegroundColor Green
+Write-Host "Bootstrap copied into WSL." -ForegroundColor Green
+Write-Host ""
 Write-Host "Next step inside WSL:" -ForegroundColor Cyan
-Write-Host "  curl -fsSL <SETUP_LINUX_URL> -o /tmp/setup-linux.sh && bash /tmp/setup-linux.sh" -ForegroundColor White
+Write-Host "  curl -fsSL '$SETUP_LINUX_URL' -o /tmp/linux-setup.sh && bash /tmp/linux-setup.sh" -ForegroundColor White
 Write-Host ""
 Write-Host "Bootstrap file:" -ForegroundColor Cyan
 Write-Host "  $BOOTSTRAP_FILE" -ForegroundColor White
