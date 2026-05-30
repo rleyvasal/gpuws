@@ -7,6 +7,7 @@ set -euo pipefail
 HOST_CONFIG_FILE="${HOME}/.config/gpuws/host.json"
 BOOTSTRAP_CONFIG_FILE="${HOME}/.config/gpuws/bootstrap.json"
 WINDOWS_BOOTSTRAP_GLOB="/mnt/c/Users/*/.config/gpuws/bootstrap.json"
+
 KERNEL_MANAGER_URL="https://raw.githubusercontent.com/rleyvasal/gpuws/main/kernel-manager.sh"
 GPUWS_HOST_SCRIPT_URL="https://raw.githubusercontent.com/rleyvasal/gpuws/main/gpuws"
 CLIENT_SETUP_TEMPLATE_URL="https://raw.githubusercontent.com/rleyvasal/gpuws/main/client-setup.sh"
@@ -71,28 +72,6 @@ print(value)
 PY
 }
 
-
-validate_ssh_public_key_format() {
-    local key="$1"
-    local key_type
-    local key_blob
-
-    key_type="$(printf '%s' "$key" | awk '{print $1}')"
-    key_blob="$(printf '%s' "$key" | awk '{print $2}')"
-
-    [ -n "$key_type" ] || return 1
-    [ -n "$key_blob" ] || return 1
-
-    case "$key_type" in
-        ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    printf '%s' "$key_blob" | grep -Eq '^[A-Za-z0-9+/=]+$'
-}
 write_host_config() {
     mkdir -p "$(dirname "$HOST_CONFIG_FILE")"
 
@@ -138,10 +117,6 @@ ensure_clients_config() {
         printf '{\n  "clients": []\n}\n' > "$clients_file"
     fi
     chmod 600 "$clients_file"
-}
-
-cloudflared_authenticated() {
-    cloudflared tunnel list >/dev/null 2>&1
 }
 
 discover_windows_bootstrap() {
@@ -204,71 +179,80 @@ apply_defaults() {
     VENV_PATH="${VENV_PATH:-$DEFAULT_ROOT_DIR/.venv}"
 }
 
-prompt_for_missing_values() {
-    [ "${NON_INTERACTIVE:-}" = "true" ] && return 0
+validate_ssh_public_key() {
+    local key="$1"
+    local tmp_key
 
-    echo ""
-    echo "Press Enter to accept defaults or enter different values."
+    [ -n "${key:-}" ] || return 1
 
-    if [ -z "${SSH_PUBLIC_KEY:-}" ]; then
-        while true; do
-            echo ""
-            echo "Paste your SSH public key:"
-            read -r -p "SSH public key: " SSH_PUBLIC_KEY
+    tmp_key="$(mktemp)"
+    printf '%s\n' "$key" > "$tmp_key"
 
-            [ -n "${SSH_PUBLIC_KEY:-}" ] || {
-                echo "SSH public key is required."
-                continue
-            }
-
-            tmp_key="$(mktemp)"
-            printf '%s\n' "$SSH_PUBLIC_KEY" > "$tmp_key"
-
-            if ssh-keygen -l -f "$tmp_key" >/dev/null 2>&1; then
-                rm -f "$tmp_key"
-                break
-            fi
-
-            rm -f "$tmp_key"
-            echo "Invalid SSH public key. Please paste a valid public key."
-            SSH_PUBLIC_KEY=""
-        done
+    if ssh-keygen -l -f "$tmp_key" >/dev/null 2>&1; then
+        rm -f "$tmp_key"
+        return 0
     fi
 
-    read -r -p "Linux SSH port [$LINUX_SSH_PORT]: " _LSP
-    LINUX_SSH_PORT="${_LSP:-$LINUX_SSH_PORT}"
-
-    if [ "$HOST_TYPE" = "windows-wsl" ]; then
-        read -r -p "Windows SSH port [$WINDOWS_SSH_PORT]: " _WSP
-        WINDOWS_SSH_PORT="${_WSP:-$WINDOWS_SSH_PORT}"
-    fi
-
-    if [ -z "${CF_DOMAIN:-}" ]; then
-        read -r -p "Cloudflare domain: " CF_DOMAIN
-    fi
-
-    read -r -p "Tunnel name [$CF_TUNNEL]: " _TUN
-    CF_TUNNEL="${_TUN:-$CF_TUNNEL}"
+    rm -f "$tmp_key"
+    return 1
 }
 
 validate_required_values() {
     [ -n "${SSH_PUBLIC_KEY:-}" ] || fail "GPUWS requires an SSH public key"
+    validate_ssh_public_key "$SSH_PUBLIC_KEY" || fail "Invalid SSH public key"
     [ -n "${CF_DOMAIN:-}" ] || fail "GPUWS requires a Cloudflare domain"
     [ -n "${CF_TUNNEL:-}" ] || fail "GPUWS requires a Cloudflare tunnel name"
 }
 
-derive_values() {
-    local short_host
-    short_host="$(hostname | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+check_or_fail() {
+    local description="$1"
+    shift
 
-    CF_HOSTNAME_LINUX="${LINUX_USER}.${CF_DOMAIN}"
-
-    if [ "$HOST_TYPE" = "windows-wsl" ] && [ -n "${WINDOWS_USER:-}" ]; then
-        CF_HOSTNAME_WIN="${short_host}.${CF_DOMAIN}"
-    else
-        CF_HOSTNAME_WIN=""
-        WINDOWS_USER=""
+    local output=""
+    if ! output="$("$@" 2>&1)"; then
+        if [ -n "$output" ]; then
+            fail "$description: $output"
+        else
+            fail "$description"
+        fi
     fi
+}
+
+set_sshd_option() {
+    local key="$1"
+    local value="$2"
+    local config_file="/etc/ssh/sshd_config"
+
+    if sudo grep -Eq "^[#[:space:]]*${key}[[:space:]]+" "$config_file"; then
+        sudo sed -i -E "s|^[#[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$config_file"
+    else
+        echo "${key} ${value}" | sudo tee -a "$config_file" >/dev/null
+    fi
+}
+
+port_in_use() {
+    local port="$1"
+    ss -ltn | awk '{print $4}' | grep -Eq "(^|:)$port$"
+}
+
+choose_free_linux_ssh_port() {
+    if [ "${NON_INTERACTIVE:-}" = "true" ]; then
+        if port_in_use "$LINUX_SSH_PORT"; then
+            fail "Port $LINUX_SSH_PORT is already in use. Choose a different Linux SSH port and rerun setup."
+        fi
+        return 0
+    fi
+
+    while port_in_use "$LINUX_SSH_PORT"; do
+        echo "Port $LINUX_SSH_PORT is already in use."
+        read -r -p "Choose a different Linux SSH port: " _NEW_LINUX_SSH_PORT
+        [ -n "$_NEW_LINUX_SSH_PORT" ] || continue
+        LINUX_SSH_PORT="$_NEW_LINUX_SSH_PORT"
+    done
+}
+
+cloudflared_authenticated() {
+    cloudflared tunnel list >/dev/null 2>&1
 }
 
 install_cloudflared() {
@@ -397,15 +381,66 @@ EOF
     sudo systemctl restart gpuws-kernel-cleanup.timer
 }
 
+derive_values() {
+    local short_host
+    short_host="$(hostname | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+
+    CF_HOSTNAME_LINUX="${LINUX_USER}.${CF_DOMAIN}"
+
+    if [ "$HOST_TYPE" = "windows-wsl" ] && [ -n "${WINDOWS_USER:-}" ]; then
+        CF_HOSTNAME_WIN="${short_host}.${CF_DOMAIN}"
+    else
+        CF_HOSTNAME_WIN=""
+        WINDOWS_USER=""
+    fi
+}
+
+prompt_for_missing_values() {
+    [ "${NON_INTERACTIVE:-}" = "true" ] && return 0
+
+    echo ""
+    echo "Press Enter to accept defaults or enter different values."
+
+    if [ -z "${SSH_PUBLIC_KEY:-}" ]; then
+        while true; do
+            echo ""
+            echo "Paste your SSH public key:"
+            read -r -p "SSH public key: " SSH_PUBLIC_KEY
+
+            if validate_ssh_public_key "$SSH_PUBLIC_KEY"; then
+                break
+            fi
+
+            echo "Invalid SSH public key. Please paste a valid public key."
+            SSH_PUBLIC_KEY=""
+        done
+    fi
+
+    read -r -p "Linux SSH port [$LINUX_SSH_PORT]: " _LSP
+    LINUX_SSH_PORT="${_LSP:-$LINUX_SSH_PORT}"
+
+    if [ "$HOST_TYPE" = "windows-wsl" ]; then
+        read -r -p "Windows SSH port [$WINDOWS_SSH_PORT]: " _WSP
+        WINDOWS_SSH_PORT="${_WSP:-$WINDOWS_SSH_PORT}"
+    fi
+
+    if [ -z "${CF_DOMAIN:-}" ]; then
+        read -r -p "Cloudflare domain: " CF_DOMAIN
+    fi
+
+    read -r -p "Tunnel name [$CF_TUNNEL]: " _TUN
+    CF_TUNNEL="${_TUN:-$CF_TUNNEL}"
+}
+
 run_health_check() {
     step "GPUWS Step 10: Health check"
 
-    sshd -t >/dev/null 2>&1 || fail "sshd configuration test failed"
+    check_or_fail "sshd configuration test failed" sudo sshd -t
     [ -x "$VENV_PATH/bin/python" ] || fail "Shared venv python missing at $VENV_PATH/bin/python"
-    [ -x "$HOME/bin/kernel-manager.sh" ] || fail "kernel-manager.sh missing"
-    [ -x "$HOME/bin/gpuws" ] || fail "gpuws host command missing"
-    [ -f "$HOME/.config/gpuws/templates/client-setup.sh" ] || fail "client-setup.sh template missing"
-    [ -f "$HOST_CONFIG_FILE" ] || fail "host.json missing"
+    [ -x "$HOME/bin/kernel-manager.sh" ] || fail "kernel-manager.sh missing at $HOME/bin/kernel-manager.sh"
+    [ -x "$HOME/bin/gpuws" ] || fail "gpuws host command missing at $HOME/bin/gpuws"
+    [ -f "$HOME/.config/gpuws/templates/client-setup.sh" ] || fail "client-setup.sh template missing at $HOME/.config/gpuws/templates/client-setup.sh"
+    [ -f "$HOST_CONFIG_FILE" ] || fail "host.json missing at $HOST_CONFIG_FILE"
 
     log "Host type: $HOST_TYPE"
     log "Linux SSH: $CF_HOSTNAME_LINUX:$LINUX_SSH_PORT"
@@ -477,39 +512,6 @@ else
     log "Dependencies already installed, skipping."
 fi
 
-set_sshd_option() {
-    local key="$1"
-    local value="$2"
-    local config_file="/etc/ssh/sshd_config"
-
-    if sudo grep -Eq "^[#[:space:]]*${key}[[:space:]]+" "$config_file"; then
-        sudo sed -i -E "s|^[#[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$config_file"
-    else
-        echo "${key} ${value}" | sudo tee -a "$config_file" >/dev/null
-    fi
-}
-
-port_in_use() {
-    local port="$1"
-    ss -ltn | awk '{print $4}' | grep -Eq "(^|:)$port$"
-}
-
-choose_free_linux_ssh_port() {
-    if [ "${NON_INTERACTIVE:-}" = "true" ]; then
-        if port_in_use "$LINUX_SSH_PORT"; then
-            fail "Port $LINUX_SSH_PORT is already in use. Choose a different Linux SSH port and rerun setup."
-        fi
-        return 0
-    fi
-
-    while port_in_use "$LINUX_SSH_PORT"; do
-        echo "Port $LINUX_SSH_PORT is already in use."
-        read -r -p "Choose a different Linux SSH port: " _NEW_LINUX_SSH_PORT
-        [ -n "$_NEW_LINUX_SSH_PORT" ] || continue
-        LINUX_SSH_PORT="$_NEW_LINUX_SSH_PORT"
-    done
-}
-
 step "GPUWS Step 3: Configure SSH on port $LINUX_SSH_PORT"
 
 choose_free_linux_ssh_port
@@ -527,20 +529,20 @@ set_sshd_option "PubkeyAuthentication" "yes"
 set_sshd_option "PasswordAuthentication" "no"
 sudo mkdir -p /run/sshd
 
-if ! sudo sshd -t; then
+if ! sudo sshd -t >/dev/null 2>&1; then
     restore_sshd_config
     fail "Invalid sshd_config after GPUWS SSH changes"
 fi
 
 if systemd_usable; then
-    if ! sudo systemctl enable ssh; then
+    if ! sudo systemctl enable ssh >/dev/null 2>&1; then
         restore_sshd_config
         fail "Failed to enable ssh service"
     fi
 
-    if ! sudo systemctl restart ssh; then
+    if ! restart_error="$(sudo systemctl restart ssh 2>&1)"; then
         restore_sshd_config
-        fail "Failed to restart ssh service"
+        fail "Failed to restart ssh service: $restart_error"
     fi
 else
     warn "systemd is not available; skipping ssh service enable/restart"
@@ -549,13 +551,7 @@ fi
 rm -f "$SSHD_CONFIG_BACKUP"
 
 step "GPUWS Step 4: Add SSH key"
-tmp_key="$(mktemp)"
-printf '%s\n' "$SSH_PUBLIC_KEY" > "$tmp_key"
-ssh-keygen -l -f "$tmp_key" >/dev/null 2>&1 || {
-    rm -f "$tmp_key"
-    fail "Invalid SSH public key"
-}
-rm -f "$tmp_key"
+validate_ssh_public_key "$SSH_PUBLIC_KEY" || fail "Invalid SSH public key"
 
 mkdir -p "$HOME/.ssh"
 touch "$HOME/.ssh/authorized_keys"
