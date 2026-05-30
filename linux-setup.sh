@@ -432,6 +432,25 @@ prompt_for_missing_values() {
     CF_TUNNEL="${_TUN:-$CF_TUNNEL}"
 }
 
+windows_bootstrap_status() {
+    local candidate
+    for candidate in $WINDOWS_BOOTSTRAP_GLOB; do
+        [ -f "$candidate" ] || continue
+
+        local win_user=""
+        local win_port=""
+        win_user="$(json_get "$candidate" windows_user)"
+        win_port="$(json_get "$candidate" windows_ssh_port)"
+
+        if [ -n "$win_user" ] || [ -n "$win_port" ]; then
+            printf '%s|%s|%s\n' "$candidate" "$win_user" "$win_port"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 run_health_check() {
     step "GPUWS Step 10: Health check"
 
@@ -444,9 +463,24 @@ run_health_check() {
 
     log "Host type: $HOST_TYPE"
     log "Linux SSH: $CF_HOSTNAME_LINUX:$LINUX_SSH_PORT"
+
     if [ "$HOST_TYPE" = "windows-wsl" ]; then
-        log "Windows SSH: $CF_HOSTNAME_WIN:$WINDOWS_SSH_PORT"
+        if [ -n "${CF_HOSTNAME_WIN:-}" ] && [ -n "${WINDOWS_USER:-}" ]; then
+            log "Windows SSH: $CF_HOSTNAME_WIN:$WINDOWS_SSH_PORT"
+        else
+            local win_bootstrap_info=""
+            if win_bootstrap_info="$(windows_bootstrap_status)"; then
+                local win_bootstrap_path=""
+                local win_bootstrap_user=""
+                local win_bootstrap_port=""
+                IFS='|' read -r win_bootstrap_path win_bootstrap_user win_bootstrap_port <<< "$win_bootstrap_info"
+                log "Windows SSH port: ${win_bootstrap_port:-22} (from Windows bootstrap: $win_bootstrap_path)"
+            else
+                log "Windows SSH port: 22 (Windows bootstrap not found)"
+            fi
+        fi
     fi
+
     log "Shared root: $DEFAULT_ROOT_DIR"
     log "Shared venv: $VENV_PATH"
     log "Host command: $HOME/bin/gpuws"
