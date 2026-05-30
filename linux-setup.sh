@@ -198,8 +198,8 @@ validate_ssh_public_key() {
 }
 
 validate_required_values() {
-    [ -n "${SSH_PUBLIC_KEY:-}" ] || fail "GPUWS requires an SSH public key"
-    validate_ssh_public_key "$SSH_PUBLIC_KEY" || fail "Invalid SSH public key"
+    [ -n "${SSH_PUBLIC_KEY:-}" ] || fail "GPUWS requires an admin SSH public key"
+    validate_ssh_public_key "$SSH_PUBLIC_KEY" || fail "Invalid admin SSH public key"
     [ -n "${CF_DOMAIN:-}" ] || fail "GPUWS requires a Cloudflare domain"
     [ -n "${CF_TUNNEL:-}" ] || fail "GPUWS requires a Cloudflare tunnel name"
 }
@@ -532,6 +532,7 @@ if [ "${NON_INTERACTIVE:-}" != "true" ]; then
     echo "Tunnel name: $CF_TUNNEL"
     echo "Shared root dir: $DEFAULT_ROOT_DIR"
     echo "Shared venv: $VENV_PATH"
+    echo "Admin SSH key: will be added for initial host access"
     echo ""
     read -r -p "Press Enter when ready..."
 fi
@@ -585,8 +586,8 @@ fi
 
 rm -f "$SSHD_CONFIG_BACKUP"
 
-step "GPUWS Step 4: Add SSH key"
-validate_ssh_public_key "$SSH_PUBLIC_KEY" || fail "Invalid SSH public key"
+step "GPUWS Step 4: Authorize admin SSH key"
+validate_ssh_public_key "$SSH_PUBLIC_KEY" || fail "Invalid admin SSH public key"
 
 mkdir -p "$HOME/.ssh"
 touch "$HOME/.ssh/authorized_keys"
