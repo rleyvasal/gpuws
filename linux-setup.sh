@@ -472,31 +472,76 @@ else
     log "Dependencies already installed, skipping."
 fi
 
+set_sshd_option() {
+    local key="$1"
+    local value="$2"
+    local config_file="/etc/ssh/sshd_config"
+
+    if sudo grep -Eq "^[#[:space:]]*${key}[[:space:]]+" "$config_file"; then
+        sudo sed -i -E "s|^[#[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$config_file"
+    else
+        echo "${key} ${value}" | sudo tee -a "$config_file" >/dev/null
+    fi
+}
+
 port_in_use() {
     local port="$1"
     ss -ltn | awk '{print $4}' | grep -Eq "(^|:)$port$"
 }
 
+choose_free_linux_ssh_port() {
+    if [ "${NON_INTERACTIVE:-}" = "true" ]; then
+        if port_in_use "$LINUX_SSH_PORT"; then
+            fail "Port $LINUX_SSH_PORT is already in use. Choose a different Linux SSH port and rerun setup."
+        fi
+        return 0
+    fi
+
+    while port_in_use "$LINUX_SSH_PORT"; do
+        echo "Port $LINUX_SSH_PORT is already in use."
+        read -r -p "Choose a different Linux SSH port: " _NEW_LINUX_SSH_PORT
+        [ -n "$_NEW_LINUX_SSH_PORT" ] || continue
+        LINUX_SSH_PORT="$_NEW_LINUX_SSH_PORT"
+    done
+}
+
 step "GPUWS Step 3: Configure SSH on port $LINUX_SSH_PORT"
-sudo sed -i -E "s/^#?Port [0-9]+/Port $LINUX_SSH_PORT/" /etc/ssh/sshd_config
-sudo sed -i -E "s/^#?\s*PubkeyAuthentication\s+.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
-sudo sed -i -E "s/^#?\s*PasswordAuthentication\s+.*/PasswordAuthentication no/" /etc/ssh/sshd_config
+
+choose_free_linux_ssh_port
+
+SSHD_CONFIG_BACKUP="$(mktemp)"
+sudo cp /etc/ssh/sshd_config "$SSHD_CONFIG_BACKUP"
+
+restore_sshd_config() {
+    sudo cp "$SSHD_CONFIG_BACKUP" /etc/ssh/sshd_config
+    rm -f "$SSHD_CONFIG_BACKUP"
+}
+
+set_sshd_option "Port" "$LINUX_SSH_PORT"
+set_sshd_option "PubkeyAuthentication" "yes"
+set_sshd_option "PasswordAuthentication" "no"
 sudo mkdir -p /run/sshd
 
-if port_in_use "$LINUX_SSH_PORT"; then
-    fail "Port $LINUX_SSH_PORT is already in use. Choose a different Linux SSH port and rerun setup."
-fi
-
 if ! sudo sshd -t; then
+    restore_sshd_config
     fail "Invalid sshd_config after GPUWS SSH changes"
 fi
 
 if systemd_usable; then
-    sudo systemctl enable ssh
-    sudo systemctl restart ssh
+    if ! sudo systemctl enable ssh; then
+        restore_sshd_config
+        fail "Failed to enable ssh service"
+    fi
+
+    if ! sudo systemctl restart ssh; then
+        restore_sshd_config
+        fail "Failed to restart ssh service"
+    fi
 else
     warn "systemd is not available; skipping ssh service enable/restart"
 fi
+
+rm -f "$SSHD_CONFIG_BACKUP"
 
 step "GPUWS Step 4: Add SSH key"
 tmp_key="$(mktemp)"
