@@ -251,13 +251,8 @@ prompt_for_missing_values() {
 
 validate_required_values() {
     [ -n "${SSH_PUBLIC_KEY:-}" ] || fail "GPUWS requires an SSH public key"
-    validate_ssh_public_key_format "$SSH_PUBLIC_KEY" || fail "Invalid SSH public key format"
     [ -n "${CF_DOMAIN:-}" ] || fail "GPUWS requires a Cloudflare domain"
     [ -n "${CF_TUNNEL:-}" ] || fail "GPUWS requires a Cloudflare tunnel name"
-
-    if [ "$HOST_TYPE" = "windows-wsl" ]; then
-        [ -n "${WINDOWS_USER:-}" ] || fail "GPUWS requires WINDOWS_USER for windows-wsl setup"
-    fi
 }
 
 derive_values() {
@@ -266,7 +261,7 @@ derive_values() {
 
     CF_HOSTNAME_LINUX="${LINUX_USER}.${CF_DOMAIN}"
 
-    if [ "$HOST_TYPE" = "windows-wsl" ]; then
+    if [ "$HOST_TYPE" = "windows-wsl" ] && [ -n "${WINDOWS_USER:-}" ]; then
         CF_HOSTNAME_WIN="${short_host}.${CF_DOMAIN}"
     else
         CF_HOSTNAME_WIN=""
