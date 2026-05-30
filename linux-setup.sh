@@ -577,7 +577,22 @@ install_cloudflared
 ensure_cloudflared_symlink
 
 if ! cloudflared_authenticated; then
-    fail "cloudflared is not authenticated. Run 'cloudflared tunnel login' and rerun this script."
+    if [ "${NON_INTERACTIVE:-}" = "true" ]; then
+        fail "cloudflared is not authenticated. Run 'cloudflared tunnel login' and rerun this script."
+    fi
+
+    echo ""
+    echo "Cloudflare authentication is required."
+    echo "A login URL will be shown next."
+    echo "If you are running inside WSL, the browser may open on Windows."
+    echo "Complete the Cloudflare login flow, then return here."
+    echo ""
+
+    cloudflared tunnel login
+
+    if ! cloudflared_authenticated; then
+        fail "cloudflared authentication did not complete successfully."
+    fi
 fi
 
 if ! cloudflared tunnel list 2>/dev/null | awk '{print $2}' | grep -qx "$CF_TUNNEL"; then
