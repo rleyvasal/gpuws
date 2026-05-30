@@ -295,22 +295,27 @@ ensure_cloudflared_symlink() {
 
     actual_path="$(command -v cloudflared 2>/dev/null || true)"
     [ -n "$actual_path" ] || fail "cloudflared is not installed or not on PATH"
+    [ -x "$actual_path" ] || fail "cloudflared binary is not executable: $actual_path"
 
     mkdir -p "$stable_dir"
 
-    if [ -L "$stable_path" ]; then
-        local current_target
-        current_target="$(readlink "$stable_path" 2>/dev/null || true)"
-        if [ "$current_target" = "$actual_path" ]; then
+    if [ -e "$stable_path" ] && [ ! -L "$stable_path" ]; then
+        if [ "$stable_path" = "$actual_path" ]; then
+            log "cloudflared already available at $stable_path"
             return 0
         fi
-    elif [ -x "$stable_path" ] && [ ! -L "$stable_path" ]; then
         warn "$stable_path already exists and is not a symlink; leaving it unchanged"
         return 0
     fi
 
-    ln -sf "$actual_path" "$stable_path"
-    [ -x "$stable_path" ] || fail "Failed to create working cloudflared symlink at $stable_path"
+    ln -sfn "$actual_path" "$stable_path"
+
+    if [ -L "$stable_path" ] || [ -x "$stable_path" ]; then
+        log "cloudflared available at $stable_path"
+        return 0
+    fi
+
+    fail "Failed to create working cloudflared symlink at $stable_path"
 }
 
 write_cloudflared_config() {
