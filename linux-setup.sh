@@ -403,15 +403,16 @@ prompt_for_missing_values() {
 
     if [ -z "${SSH_PUBLIC_KEY:-}" ]; then
         while true; do
-            echo ""
-            echo "Paste your SSH public key:"
-            read -r -p "SSH public key: " SSH_PUBLIC_KEY
-
+	    echo ""
+	    echo "Paste the admin SSH public key from the machine you will use to access this GPU host."
+	    echo "This grants initial SSH access to the host."
+	    echo "Example source: ~/.ssh/id_ed25519.pub on your laptop or client machine."
+	    read -r -p "Admin SSH public key: " SSH_PUBLIC_KEY
             if validate_ssh_public_key "$SSH_PUBLIC_KEY"; then
                 break
             fi
 
-            echo "Invalid SSH public key. Please paste a valid public key."
+            echo "Invalid admin SSH public key. Please paste a valid public key from the client machine you will use to access this host."
             SSH_PUBLIC_KEY=""
         done
     fi
