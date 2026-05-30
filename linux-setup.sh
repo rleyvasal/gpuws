@@ -209,9 +209,28 @@ prompt_for_missing_values() {
     echo "Press Enter to accept defaults or enter different values."
 
     if [ -z "${SSH_PUBLIC_KEY:-}" ]; then
-        echo ""
-        echo "Paste your SSH public key:"
-        read -r -p "SSH public key: " SSH_PUBLIC_KEY
+        while true; do
+            echo ""
+            echo "Paste your SSH public key:"
+            read -r -p "SSH public key: " SSH_PUBLIC_KEY
+
+            [ -n "${SSH_PUBLIC_KEY:-}" ] || {
+                echo "SSH public key is required."
+                continue
+            }
+
+            tmp_key="$(mktemp)"
+            printf '%s\n' "$SSH_PUBLIC_KEY" > "$tmp_key"
+
+            if ssh-keygen -l -f "$tmp_key" >/dev/null 2>&1; then
+                rm -f "$tmp_key"
+                break
+            fi
+
+            rm -f "$tmp_key"
+            echo "Invalid SSH public key. Please paste a valid public key."
+            SSH_PUBLIC_KEY=""
+        done
     fi
 
     read -r -p "Linux SSH port [$LINUX_SSH_PORT]: " _LSP
@@ -229,6 +248,7 @@ prompt_for_missing_values() {
     read -r -p "Tunnel name [$CF_TUNNEL]: " _TUN
     CF_TUNNEL="${_TUN:-$CF_TUNNEL}"
 }
+
 validate_required_values() {
     [ -n "${SSH_PUBLIC_KEY:-}" ] || fail "GPUWS requires an SSH public key"
     validate_ssh_public_key_format "$SSH_PUBLIC_KEY" || fail "Invalid SSH public key format"
