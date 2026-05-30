@@ -93,7 +93,6 @@ Then, inside WSL, run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpuws/main/linux-setup.sh -o /tmp/linux-setup.sh && bash /tmp/linux-setup.sh
-bash /tmp/linux-setup.sh
 ```
 
 ### Option 2: Standalone Linux

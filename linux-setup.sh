@@ -70,6 +70,8 @@ if value is None:
 print(value)
 PY
 }
+
+
 validate_ssh_public_key_format() {
     local key="$1"
     local key_type
@@ -470,11 +472,24 @@ else
     log "Dependencies already installed, skipping."
 fi
 
+port_in_use() {
+    local port="$1"
+    ss -ltn | awk '{print $4}' | grep -Eq "(^|:)$port$"
+}
+
 step "GPUWS Step 3: Configure SSH on port $LINUX_SSH_PORT"
 sudo sed -i -E "s/^#?Port [0-9]+/Port $LINUX_SSH_PORT/" /etc/ssh/sshd_config
-sudo sed -i -E "s/#?(PubkeyAuthentication).*/\1 yes/" /etc/ssh/sshd_config
-sudo sed -i -E "s/#?(PasswordAuthentication).*/\1 no/" /etc/ssh/sshd_config
+sudo sed -i -E "s/^#?\s*PubkeyAuthentication\s+.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
+sudo sed -i -E "s/^#?\s*PasswordAuthentication\s+.*/PasswordAuthentication no/" /etc/ssh/sshd_config
 sudo mkdir -p /run/sshd
+
+if port_in_use "$LINUX_SSH_PORT"; then
+    fail "Port $LINUX_SSH_PORT is already in use. Choose a different Linux SSH port and rerun setup."
+fi
+
+if ! sudo sshd -t; then
+    fail "Invalid sshd_config after GPUWS SSH changes"
+fi
 
 if systemd_usable; then
     sudo systemctl enable ssh
