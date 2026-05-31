@@ -72,6 +72,12 @@ print(value)
 PY
 }
 
+sanitize_host_label() {
+    printf '%s' "$1" \
+      | tr '[:upper:]' '[:lower:]' \
+      | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+}
+
 write_host_config() {
     mkdir -p "$(dirname "$HOST_CONFIG_FILE")"
 
@@ -175,17 +181,12 @@ apply_env_overrides() {
     CF_TUNNEL="${GPUWS_CF_TUNNEL:-${CF_TUNNEL:-}}"
 }
 
-sanitize_host_label() {
-    printf '%s' "$1" \
-      | tr '[:upper:]' '[:lower:]' \
-      | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
-}
-
 apply_defaults() {
     HOST_TYPE="${HOST_TYPE:-$DETECTED_HOST_TYPE}"
     LINUX_USER="${LINUX_USER:-$(whoami)}"
     LINUX_SSH_PORT="${LINUX_SSH_PORT:-2222}"
     WINDOWS_SSH_PORT="${WINDOWS_SSH_PORT:-22}"
+    CF_TUNNEL="${CF_TUNNEL:-gpuws}"
     DEFAULT_ROOT_DIR="${DEFAULT_ROOT_DIR:-/home/$LINUX_USER/gpws}"
     VENV_PATH="${VENV_PATH:-$DEFAULT_ROOT_DIR/.venv}"
 
@@ -293,17 +294,26 @@ ensure_cloudflared_symlink() {
     local stable_path="$stable_dir/cloudflared"
     local actual_path
 
-    actual_path="$(command -v cloudflared 2>/dev/null || true)"
-    [ -n "$actual_path" ] || fail "cloudflared is not installed or not on PATH"
-    [ -x "$actual_path" ] || fail "cloudflared binary is not executable: $actual_path"
-
     mkdir -p "$stable_dir"
 
-    if [ -e "$stable_path" ] && [ ! -L "$stable_path" ]; then
-        if [ "$stable_path" = "$actual_path" ]; then
+    if [ -L "$stable_path" ] && ! readlink "$stable_path" >/dev/null 2>&1; then
+        rm -f "$stable_path"
+    fi
+
+    actual_path="$(command -v cloudflared 2>/dev/null || true)"
+    [ -n "$actual_path" ] || fail "cloudflared is not installed or not on PATH"
+
+    if [ "$actual_path" = "$stable_path" ]; then
+        if [ -x "$stable_path" ]; then
             log "cloudflared already available at $stable_path"
             return 0
         fi
+        fail "cloudflared at $stable_path is not executable"
+    fi
+
+    [ -x "$actual_path" ] || fail "cloudflared binary is not executable: $actual_path"
+
+    if [ -e "$stable_path" ] && [ ! -L "$stable_path" ]; then
         warn "$stable_path already exists and is not a symlink; leaving it unchanged"
         return 0
     fi
@@ -349,7 +359,7 @@ install_cloudflared_service() {
     cloudflared_path="$(command -v cloudflared)"
     [ -n "$cloudflared_path" ] || fail "cloudflared binary not found for systemd service"
 
-    sudo tee /etc/systemd/system/gpuws-cloudflared.service > /dev/null <<EOF
+    sudo tee /etc/systemd/system/gpuws-cloudflared.service >/dev/null <<EOF
 [Unit]
 Description=GPUWS Cloudflare Tunnel
 After=network.target
@@ -370,7 +380,7 @@ EOF
 }
 
 install_kernel_cleanup_timer() {
-    sudo tee /etc/systemd/system/gpuws-kernel-cleanup.service > /dev/null <<EOF
+    sudo tee /etc/systemd/system/gpuws-kernel-cleanup.service >/dev/null <<EOF
 [Unit]
 Description=Cleanup inactive GPUWS kernels
 
@@ -380,7 +390,7 @@ User=${LINUX_USER}
 ExecStart=${HOME}/bin/kernel-manager.sh cleanup
 EOF
 
-    sudo tee /etc/systemd/system/gpuws-kernel-cleanup.timer > /dev/null <<EOF
+    sudo tee /etc/systemd/system/gpuws-kernel-cleanup.timer >/dev/null <<EOF
 [Unit]
 Description=Run GPUWS kernel cleanup daily
 
@@ -482,6 +492,7 @@ run_health_check() {
 
     log "Host type: $HOST_TYPE"
     log "Host label: $HOST_LABEL"
+    log "Tunnel name: $CF_TUNNEL"
     log "Linux SSH: $CF_HOSTNAME_LINUX:$LINUX_SSH_PORT"
 
     if [ "$HOST_TYPE" = "windows-wsl" ]; then
@@ -551,6 +562,10 @@ if [ "${NON_INTERACTIVE:-}" != "true" ]; then
     fi
     echo "Cloudflare domain: $CF_DOMAIN"
     echo "Tunnel name: $CF_TUNNEL"
+    echo "Linux hostname: ${CF_HOSTNAME_LINUX}"
+    if [ "$HOST_TYPE" = "windows-wsl" ]; then
+        echo "Windows hostname: ${CF_HOSTNAME_WIN}"
+    fi
     echo "Shared root dir: $DEFAULT_ROOT_DIR"
     echo "Shared venv: $VENV_PATH"
     echo "Admin SSH key: will be added for initial host access"
@@ -687,8 +702,9 @@ if ! cloudflared_authenticated; then
     echo ""
     echo "Cloudflare authentication is required."
     echo "A login URL will be shown next."
+    echo "Before using that URL, make sure you are signed in to the correct Cloudflare account in your browser."
     echo "If you are running inside WSL, the browser may open on Windows."
-    echo "Complete the Cloudflare login flow, then return here."
+    echo "If the first redirect only signs you in, open the displayed URL again after login."
     echo ""
 
     cloudflared tunnel login
@@ -705,9 +721,12 @@ fi
 TUNNEL_ID="$(cloudflared tunnel list | awk -v tunnel="$CF_TUNNEL" '$2 == tunnel {print $1; exit}')"
 [ -n "$TUNNEL_ID" ] || fail "Failed to determine tunnel id for $CF_TUNNEL"
 
-cloudflared tunnel route dns "$CF_TUNNEL" "$CF_HOSTNAME_LINUX" 2>/dev/null || true
+check_or_fail "Failed to create DNS route for $CF_HOSTNAME_LINUX" \
+    cloudflared tunnel route dns "$CF_TUNNEL" "$CF_HOSTNAME_LINUX"
+
 if [ "$HOST_TYPE" = "windows-wsl" ]; then
-    cloudflared tunnel route dns "$CF_TUNNEL" "$CF_HOSTNAME_WIN" 2>/dev/null || true
+    check_or_fail "Failed to create DNS route for $CF_HOSTNAME_WIN" \
+        cloudflared tunnel route dns "$CF_TUNNEL" "$CF_HOSTNAME_WIN"
 fi
 
 write_cloudflared_config "$TUNNEL_ID"
