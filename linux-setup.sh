@@ -76,6 +76,7 @@ write_host_config() {
     mkdir -p "$(dirname "$HOST_CONFIG_FILE")"
 
     HOST_TYPE_VALUE="$HOST_TYPE" \
+    HOST_LABEL_VALUE="$HOST_LABEL" \
     LINUX_USER_VALUE="$LINUX_USER" \
     WINDOWS_USER_VALUE="$WINDOWS_USER" \
     LINUX_SSH_PORT_VALUE="$LINUX_SSH_PORT" \
@@ -92,6 +93,7 @@ import json, os, pathlib, sys
 path = pathlib.Path(sys.argv[1]).expanduser()
 data = {
     "host_type": os.environ["HOST_TYPE_VALUE"],
+    "host_label": os.environ["HOST_LABEL_VALUE"],
     "linux_user": os.environ["LINUX_USER_VALUE"],
     "windows_user": os.environ["WINDOWS_USER_VALUE"],
     "linux_ssh_port": int(os.environ["LINUX_SSH_PORT_VALUE"]),
@@ -138,6 +140,7 @@ load_host_json_values() {
     [ -f "$HOST_CONFIG_FILE" ] || return 0
 
     HOST_TYPE="$(json_get "$HOST_CONFIG_FILE" host_type)"
+    HOST_LABEL="$(json_get "$HOST_CONFIG_FILE" host_label)"
     LINUX_USER="$(json_get "$HOST_CONFIG_FILE" linux_user)"
     WINDOWS_USER="$(json_get "$HOST_CONFIG_FILE" windows_user)"
     LINUX_SSH_PORT="$(json_get "$HOST_CONFIG_FILE" linux_ssh_port)"
@@ -152,6 +155,7 @@ load_bootstrap_values() {
     [ -f "$BOOTSTRAP_CONFIG_FILE" ] || return 0
 
     HOST_TYPE="${HOST_TYPE:-$(json_get "$BOOTSTRAP_CONFIG_FILE" host_type)}"
+    HOST_LABEL="${HOST_LABEL:-$(json_get "$BOOTSTRAP_CONFIG_FILE" host_label)}"
     WINDOWS_USER="${WINDOWS_USER:-$(json_get "$BOOTSTRAP_CONFIG_FILE" windows_user)}"
     LINUX_SSH_PORT="${LINUX_SSH_PORT:-$(json_get "$BOOTSTRAP_CONFIG_FILE" linux_ssh_port)}"
     WINDOWS_SSH_PORT="${WINDOWS_SSH_PORT:-$(json_get "$BOOTSTRAP_CONFIG_FILE" windows_ssh_port)}"
@@ -162,6 +166,7 @@ load_bootstrap_values() {
 
 apply_env_overrides() {
     HOST_TYPE="${GPUWS_HOST_TYPE:-${HOST_TYPE:-}}"
+    HOST_LABEL="${GPUWS_HOST_LABEL:-${HOST_LABEL:-}}"
     WINDOWS_USER="${GPUWS_WINDOWS_USER:-${WINDOWS_USER:-}}"
     LINUX_SSH_PORT="${GPUWS_LINUX_SSH_PORT:-${LINUX_SSH_PORT:-}}"
     WINDOWS_SSH_PORT="${GPUWS_WINDOWS_SSH_PORT:-${WINDOWS_SSH_PORT:-}}"
@@ -177,6 +182,10 @@ apply_defaults() {
     WINDOWS_SSH_PORT="${WINDOWS_SSH_PORT:-22}"
     DEFAULT_ROOT_DIR="${DEFAULT_ROOT_DIR:-/home/$LINUX_USER/gpws}"
     VENV_PATH="${VENV_PATH:-$DEFAULT_ROOT_DIR/.venv}"
+
+    if [ -z "${HOST_LABEL:-}" ]; then
+        HOST_LABEL="$(sanitize_host_label "$(hostname)")"
+    fi
 }
 
 validate_ssh_public_key() {
@@ -197,11 +206,15 @@ validate_ssh_public_key() {
     return 1
 }
 
-validate_required_values() {
-    [ -n "${SSH_PUBLIC_KEY:-}" ] || fail "GPUWS requires an admin SSH public key"
-    validate_ssh_public_key "$SSH_PUBLIC_KEY" || fail "Invalid admin SSH public key"
-    [ -n "${CF_DOMAIN:-}" ] || fail "GPUWS requires a Cloudflare domain"
-    [ -n "${CF_TUNNEL:-}" ] || fail "GPUWS requires a Cloudflare tunnel name"
+derive_values() {
+    CF_HOSTNAME_LINUX="${HOST_LABEL}.${CF_DOMAIN}"
+
+    if [ "$HOST_TYPE" = "windows-wsl" ]; then
+        CF_HOSTNAME_WIN="${HOST_LABEL}-win.${CF_DOMAIN}"
+    else
+        CF_HOSTNAME_WIN=""
+        WINDOWS_USER=""
+    fi
 }
 
 check_or_fail() {
@@ -403,11 +416,12 @@ prompt_for_missing_values() {
 
     if [ -z "${SSH_PUBLIC_KEY:-}" ]; then
         while true; do
-	    echo ""
-	    echo "Paste the admin SSH public key from the machine you will use to access this GPU host."
-	    echo "This grants initial SSH access to the host."
-	    echo "Example source: ~/.ssh/id_ed25519.pub on your laptop or client machine."
-	    read -r -p "Admin SSH public key: " SSH_PUBLIC_KEY
+            echo ""
+            echo "Paste the admin SSH public key from the machine you will use to access this GPU host."
+            echo "This grants initial SSH access to the host."
+            echo "Example source: ~/.ssh/id_ed25519.pub on your laptop or client machine."
+            read -r -p "Admin SSH public key: " SSH_PUBLIC_KEY
+
             if validate_ssh_public_key "$SSH_PUBLIC_KEY"; then
                 break
             fi
@@ -416,6 +430,10 @@ prompt_for_missing_values() {
             SSH_PUBLIC_KEY=""
         done
     fi
+
+    read -r -p "Host label [$HOST_LABEL]: " _HL
+    HOST_LABEL="$(sanitize_host_label "${_HL:-$HOST_LABEL}")"
+    [ -n "$HOST_LABEL" ] || fail "Host label is required"
 
     read -r -p "Linux SSH port [$LINUX_SSH_PORT]: " _LSP
     LINUX_SSH_PORT="${_LSP:-$LINUX_SSH_PORT}"
@@ -463,23 +481,11 @@ run_health_check() {
     [ -f "$HOST_CONFIG_FILE" ] || fail "host.json missing at $HOST_CONFIG_FILE"
 
     log "Host type: $HOST_TYPE"
+    log "Host label: $HOST_LABEL"
     log "Linux SSH: $CF_HOSTNAME_LINUX:$LINUX_SSH_PORT"
 
     if [ "$HOST_TYPE" = "windows-wsl" ]; then
-        if [ -n "${CF_HOSTNAME_WIN:-}" ] && [ -n "${WINDOWS_USER:-}" ]; then
-            log "Windows SSH: $CF_HOSTNAME_WIN:$WINDOWS_SSH_PORT"
-        else
-            local win_bootstrap_info=""
-            if win_bootstrap_info="$(windows_bootstrap_status)"; then
-                local win_bootstrap_path=""
-                local win_bootstrap_user=""
-                local win_bootstrap_port=""
-                IFS='|' read -r win_bootstrap_path win_bootstrap_user win_bootstrap_port <<< "$win_bootstrap_info"
-                log "Windows SSH port: ${win_bootstrap_port:-22} (from Windows bootstrap: $win_bootstrap_path)"
-            else
-                log "Windows SSH port: 22 (Windows bootstrap not found)"
-            fi
-        fi
+        log "Windows SSH: $CF_HOSTNAME_WIN:$WINDOWS_SSH_PORT"
     fi
 
     log "Shared root: $DEFAULT_ROOT_DIR"
@@ -502,6 +508,7 @@ require_debian_family
 discover_windows_bootstrap
 
 HOST_TYPE=""
+HOST_LABEL=""
 LINUX_USER=""
 WINDOWS_USER=""
 LINUX_SSH_PORT=""
@@ -523,6 +530,7 @@ derive_values
 if [ "${NON_INTERACTIVE:-}" != "true" ]; then
     echo ""
     echo "Host type: $HOST_TYPE"
+    echo "Host label: $HOST_LABEL"
     echo "Linux user: $LINUX_USER"
     echo "Linux SSH port: $LINUX_SSH_PORT"
     if [ "$HOST_TYPE" = "windows-wsl" ]; then
