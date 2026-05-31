@@ -30,6 +30,8 @@ It uses:
 
 GPUWS writes host state to:
 
+### Linux / WSL host
+
 - `~/.config/gpuws/host.json`
 - `~/.config/gpuws/bootstrap.json`
 - `~/.config/gpuws/clients.json`
@@ -47,21 +49,49 @@ Shared runtime:
 - `/home/<linux_user>/gpws/.venv`
 - `/home/<linux_user>/gpws/<client_name>/`
 
+### Windows side
+
+- `%USERPROFILE%\.config\gpuws\bootstrap.json`
+- `%USERPROFILE%\.config\gpuws\windows-host.json`
+
 ## Requirements
 
 Before starting, you should have:
 
 - a Cloudflare account and domain
-- Cloudflare Tunnel access configured for your domain
-- an SSH public key for the first host admin/client
+- permission to create or use Cloudflare tunnels for your domain
+- an admin SSH public key from the machine you will use to access the host
 - Ubuntu/Debian on Linux, or Windows 11 with WSL support
+
+## Core Concepts
+
+GPUWS now treats these as two separate pieces of Cloudflare identity:
+
+- `host_label`
+- `tunnel name`
+
+They are not the same thing.
+
+`host_label` controls the public hostname:
+
+- Linux hostname: `<host_label>.<cf_domain>`
+- Windows hostname in WSL mode: `<host_label>-win.<cf_domain>`
+
+`tunnel name` controls the Cloudflare tunnel object:
+
+- example: `gpuws`
+- example: `gpuws-test`
+
+This separation is important for side-by-side WSL setups. Multiple WSL environments should use different:
+
+- `host_label`
+- `tunnel name`
 
 ## Installation
 
 ### Option 1: Windows 11 + WSL
 
 Run PowerShell as Administrator.
-
 
 Run:
 
@@ -73,14 +103,17 @@ The script will:
 
 - install or detect WSL
 - ask for your WSL distro
+- ask for a `host_label`
 - ask for Linux SSH port and Windows SSH port
-- ask for your SSH public key
+- ask for your admin SSH public key
 - ask for your Cloudflare domain and tunnel name
 - configure Windows OpenSSH
 - configure Windows firewall
 - disable Windows sleep / WSL idle timeout
-- save bootstrap config to:
-  `%USERPROFILE%\.config\gpuws\bootstrap.json`
+- validate `sshd_config` before restart, with rollback on failure
+- save:
+  - `%USERPROFILE%\.config\gpuws\bootstrap.json`
+  - `%USERPROFILE%\.config\gpuws\windows-host.json`
 
 If WSL user setup is not complete yet, the script will stop and print the exact commands to:
 
@@ -97,10 +130,7 @@ curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpuws/main/linux-setup.sh
 
 ### Option 2: Standalone Linux
 
-On Ubuntu/Debian:
-
-
-Run:
+On Ubuntu/Debian, run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpuws/main/linux-setup.sh -o /tmp/linux-setup.sh && bash /tmp/linux-setup.sh
@@ -108,10 +138,15 @@ curl -fsSL https://raw.githubusercontent.com/rleyvasal/gpuws/main/linux-setup.sh
 
 The script will ask for:
 
-- your SSH public key
+- your admin SSH public key
+- `host_label`
 - Linux SSH port
 - Cloudflare domain
 - Cloudflare tunnel name
+
+In WSL mode, it may also confirm:
+
+- Windows SSH port
 
 Defaults are shown where applicable. Press Enter to accept defaults or enter different values.
 
@@ -128,7 +163,7 @@ It will:
 2. load `host.json` or `bootstrap.json` if present
 3. install dependencies
 4. configure Linux SSH
-5. add the SSH public key to `authorized_keys`
+5. add the admin SSH public key to `authorized_keys` for initial host access
 6. prepare `/home/<linux_user>/gpws/`
 7. install `uv`
 8. create the shared Python 3.12 `.venv`
@@ -152,8 +187,14 @@ Cloudflare authentication note:
 
 - Before using the URL shown by `cloudflared tunnel login`, make sure you are already signed in to the correct Cloudflare account in your browser.
 - If the first browser redirect only signs you in, open the displayed login URL again after login to complete tunnel authorization.
-- Click on domain name
-- Click Authorize on popur window
+- Approve the selected domain when Cloudflare asks you to authorize it.
+
+Cloudflare DNS note:
+
+- GPUWS now fails loudly if the selected hostname already exists in Cloudflare DNS.
+- If setup fails because a hostname already exists, either:
+  - choose a different `host_label`
+  - or remove/reassign the old DNS record if you intentionally want to reuse that hostname
 
 After success, the next step is:
 
@@ -172,6 +213,8 @@ gpuws host status
 You should see:
 
 - host type
+- host label
+- tunnel name
 - Linux SSH endpoint
 - Windows SSH endpoint if using WSL
 - shared root dir
@@ -208,7 +251,7 @@ GPUWS will:
 - create a dedicated kernel for that client
 - record the client in `~/.config/gpuws/clients.json`
 - generate:
-  `~/.config/gpuws/generated/<client_name>-install.sh`
+  - `~/.config/gpuws/generated/<client_name>-install.sh`
 
 ## List Clients
 
@@ -255,6 +298,23 @@ The client only needs one file from the host:
 
 Share that installer script securely with the client.
 
+### Moving the installer from WSL to Windows
+
+If the host is running inside WSL, a simple way to make the installer easy to transfer is:
+
+```bash
+cp ~/.config/gpuws/generated/<client_name>-install.sh /mnt/c/Users/<windows_user>/Downloads/
+```
+
+From there, you can move it to the client machine using your preferred method, for example:
+
+- AirDrop
+- secure file share
+- USB
+- encrypted message or storage service
+
+### Run on the client machine
+
 On the client machine:
 
 ```bash
@@ -284,31 +344,38 @@ After client install, the client machine will have:
 - `~/.config/gpuws/client.json`
 - updated `~/.ssh/config`
 
-## End-to-End Test Order
+The generated SSH config will include:
 
-If you already have an older WSL setup, do not use that as your first clean test.
+- `gpuws-linux`
+- `gpuws-windows` when Windows access is configured
+
+## End-to-End Test Order
 
 Recommended order:
 
-1. test on a fresh WSL distro or clean Ubuntu environment
-2. run host setup
-3. run `gpuws host status`
-4. run `gpuws client add`
-5. inspect generated installer
-6. run client installer on a second machine
-7. verify:
-   - `ssh gpuws-linux`
-   - optional `ssh gpuws-windows`
+1. prepare a fresh WSL distro or clean Ubuntu environment
+2. run Windows setup if using WSL
+3. run Linux setup
+4. run `gpuws host status`
+5. run `gpuws client add`
+6. inspect the generated installer
+7. copy the installer from WSL to a Windows-visible path if needed
+8. move the installer to the client machine
+9. run the client installer
+10. verify:
+    - `ssh gpuws-linux`
+    - optional `ssh gpuws-windows`
 
 ## Notes
 
 - The shared ML environment is:
-  `/home/<linux_user>/gpws/.venv`
+  - `/home/<linux_user>/gpws/.venv`
 - Each client gets its own work directory:
-  `/home/<linux_user>/gpws/<client_name>/`
+  - `/home/<linux_user>/gpws/<client_name>/`
 - Each client gets its own kernel name matching its normalized client name
 - `kernel-manager.sh` remains an internal runtime tool
 - `gpuws` is the user-facing host management command
+- The admin SSH key used during host setup is separate from managed client records
 
 ## Troubleshooting
 
@@ -323,6 +390,11 @@ Then rerun:
 ```bash
 bash linux-setup.sh
 ```
+
+If Cloudflare DNS route creation fails because the hostname already exists:
+
+- choose a different `host_label`
+- or clean up the existing DNS record if you intend to reuse that hostname
 
 If client SSH fails:
 
@@ -340,5 +412,5 @@ If WSL handoff is incomplete:
 
 - launch the distro once
 - create the Linux user
-- rerun `windows-setup.ps1`, or use the printed copy-and-run commands
-
+- rerun `windows-setup.ps1`
+- or use the printed copy-and-run commands
