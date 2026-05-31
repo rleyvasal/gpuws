@@ -71,17 +71,26 @@ ensure_cloudflared_symlink() {
     local stable_path="$stable_dir/cloudflared"
     local actual_path
 
-    actual_path="$(command -v cloudflared 2>/dev/null || true)"
-    [ -n "$actual_path" ] || fail "cloudflared is not installed or not on PATH"
-    [ -x "$actual_path" ] || fail "cloudflared binary is not executable: $actual_path"
-
     mkdir -p "$stable_dir"
 
-    if [ -e "$stable_path" ] && [ ! -L "$stable_path" ]; then
-        if [ "$stable_path" = "$actual_path" ]; then
+    if [ -L "$stable_path" ] && ! readlink "$stable_path" >/dev/null 2>&1; then
+        rm -f "$stable_path"
+    fi
+
+    actual_path="$(command -v cloudflared 2>/dev/null || true)"
+    [ -n "$actual_path" ] || fail "cloudflared is not installed or not on PATH"
+
+    if [ "$actual_path" = "$stable_path" ]; then
+        if [ -x "$stable_path" ]; then
             log "cloudflared already available at $stable_path"
             return 0
         fi
+        fail "cloudflared at $stable_path is not executable"
+    fi
+
+    [ -x "$actual_path" ] || fail "cloudflared binary is not executable: $actual_path"
+
+    if [ -e "$stable_path" ] && [ ! -L "$stable_path" ]; then
         warn "$stable_path already exists and is not a symlink; leaving it unchanged"
         return 0
     fi
@@ -147,6 +156,7 @@ EOF
 
     log "GPUWS client configuration written to $config_file"
 }
+
 update_ssh_config() {
     local ssh_dir="$HOME/.ssh"
     local ssh_config="$ssh_dir/config"
@@ -158,7 +168,6 @@ update_ssh_config() {
     touch "$ssh_config"
 
     tmp="$(mktemp)"
-
     sed '/^# BEGIN GPUWS$/,/^# END GPUWS$/d' "$ssh_config" > "$tmp"
 
     gpuws_block="$(cat <<EOF
@@ -171,9 +180,9 @@ Host gpuws-linux
   ProxyCommand $proxy_cmd $CF_HOSTNAME_LINUX
   ControlMaster auto
   ControlPath ~/.ssh/control-%r@%h:%p
-  ControlPersist yes
-  ServerAliveInterval 60
-  ServerAliveCountMax 10
+  ControlPersist 10m
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
 EOF
 )"
 
@@ -186,8 +195,11 @@ Host gpuws-windows
   User $WINDOWS_USER
   IdentityFile $IDENTITY_FILE
   ProxyCommand $proxy_cmd $CF_HOSTNAME_WIN
-  ServerAliveInterval 60
-  ServerAliveCountMax 10"
+  ControlMaster auto
+  ControlPath ~/.ssh/control-%r@%h:%p
+  ControlPersist 10m
+  ServerAliveInterval 30
+  ServerAliveCountMax 3"
     fi
 
     gpuws_block="$gpuws_block
@@ -208,7 +220,6 @@ Host gpuws-windows
         log "GPUWS SSH config updated for gpuws-windows"
     fi
 }
-
 
 print_linux_failure() {
     local ssh_error="${1:-}"
@@ -246,9 +257,20 @@ print_linux_failure() {
 }
 
 print_windows_warning() {
+    local ssh_error="${1:-}"
+
     echo ""
     echo "GPUWS warning: SSH test failed for gpuws-windows."
     echo "Linux access works, so client setup is still usable."
+
+    if [ -n "$ssh_error" ]; then
+        echo ""
+        echo "SSH reported:"
+        while IFS= read -r line; do
+            [ -n "$line" ] && echo "  $line"
+        done <<< "$ssh_error"
+    fi
+
     echo ""
     echo "If you need Windows host access, check:"
     echo "  1. IdentityFile path"
@@ -285,6 +307,8 @@ test_linux_ssh() {
         -o ConnectTimeout=10 \
         -o StrictHostKeyChecking=accept-new \
         -o LogLevel=ERROR \
+        -o ControlMaster=no \
+        -o ControlPath=none \
         gpuws-linux echo GPUWS_OK 2>&1)"; then
         log "Connection to gpuws-linux verified"
         return 0
@@ -307,6 +331,8 @@ test_windows_ssh() {
         -o ConnectTimeout=10 \
         -o StrictHostKeyChecking=accept-new \
         -o LogLevel=ERROR \
+        -o ControlMaster=no \
+        -o ControlPath=none \
         gpuws-windows echo GPUWS_OK 2>&1)"; then
         log "Connection to gpuws-windows verified"
         return 0
