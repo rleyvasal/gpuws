@@ -4,7 +4,7 @@ set -euo pipefail
 REGISTRY="${HOME}/.kernels/registry.json"
 KERNELS_DIR="${HOME}/.kernels"
 RUNTIME_DIR="${HOME}/.local/share/jupyter/runtime"
-WORK_DIR_DEFAULT="${HOME}/gpu_dev_projects"
+WORK_DIR_DEFAULT="${HOME}/gpws"
 INACTIVITY_HOURS="${INACTIVITY_HOURS:-24}"
 
 log() {
@@ -51,8 +51,7 @@ random_suffix() {
 
 default_kernel_name() {
     local seed
-    seed="${KERNEL_CLIENT_NAME:-${KERNEL_DEVICE_NAME:-$(hostname)}}"
-    seed="$(sanitize_name "$seed")"
+    seed="$(sanitize_name "$(hostname)")"
     [ -n "$seed" ] || seed="kernel"
     printf '%s-%s\n' "$seed" "$(random_suffix)"
 }
@@ -156,7 +155,6 @@ create_connection_file() {
   "kernel_name": "python3"
 }
 EOF
-
     chmod 600 "$conn_file"
 }
 
@@ -167,7 +165,7 @@ create_service() {
     local venv_python="$4"
     local conn_file="$5"
 
-    sudo tee "/etc/systemd/system/${service_name}.service" > /dev/null <<EOF
+    sudo tee "/etc/systemd/system/${service_name}.service" >/dev/null <<EOF
 [Unit]
 Description=Persistent IPython Kernel (${service_name})
 After=network.target
@@ -220,7 +218,17 @@ cmd_create() {
     [ -x "$venv_python" ] || fail "Python executable not found: $venv_python"
 
     if kernel_exists "$name"; then
+        local existing_python
+        local existing_work_dir
+        existing_python="$(read_registry_field "$name" "venv_python")"
+        existing_work_dir="$(read_registry_field "$name" "work_dir")"
+
+        if [ "$existing_python" != "$venv_python" ] || [ "$existing_work_dir" != "$work_dir" ]; then
+            fail "Kernel '$name' already exists with different settings"
+        fi
+
         log "Kernel '$name' already exists"
+        cat "$(read_registry_field "$name" "conn_file")"
         exit 0
     fi
 
@@ -257,16 +265,28 @@ cmd_delete() {
     log "Kernel '$name' deleted"
 }
 
+cmd_restart() {
+    local name="${2:-}"
+    local service_name
+
+    [ -n "$name" ] || fail "Usage: $0 restart <name>"
+    kernel_exists "$name" || fail "Kernel '$name' not found"
+
+    service_name="$(read_registry_field "$name" "service_name")"
+    [ -n "$service_name" ] || fail "No service registered for kernel '$name'"
+
+    sudo systemctl restart "$service_name"
+    log "Kernel '$name' restarted"
+}
+
 cmd_list() {
     python3 - "$REGISTRY" <<'PY'
 import json, sys, subprocess
 with open(sys.argv[1], encoding="utf-8") as f:
     data = json.load(f)
-
 if not data:
     print("No kernels registered")
     raise SystemExit(0)
-
 print(f"{'NAME':24} {'STATUS':10} {'PORTS':15} {'WORK_DIR'}")
 for name, info in sorted(data.items()):
     service = info.get("service_name", "")
@@ -340,6 +360,7 @@ usage() {
 Usage:
   $0 create [name] [python_path] [work_dir]
   $0 delete <name>
+  $0 restart <name>
   $0 list
   $0 touch <name>
   $0 status <name>
@@ -355,6 +376,7 @@ main() {
     case "${1:-}" in
         create)  cmd_create "$@" ;;
         delete)  cmd_delete "$@" ;;
+        restart) cmd_restart "$@" ;;
         list)    cmd_list ;;
         touch)   cmd_touch "$@" ;;
         status)  cmd_status "$@" ;;

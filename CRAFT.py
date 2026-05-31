@@ -1,27 +1,63 @@
 import base64
 import json
-import os
 import re
-import shutil
+import shlex
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+from IPython import get_ipython
 from IPython.core.magic import register_line_cell_magic
 from IPython.display import HTML, Image, clear_output, display
 from jupyter_client import BlockingKernelClient
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+
 CONFIG_PATH = Path.home() / ".config" / "gpuws" / "client.json"
-_cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+SSH_CONFIG_PATH = Path.home() / ".ssh" / "config"
+CLOUDFLARED_STABLE_PATH = Path.home() / ".local" / "bin" / "cloudflared"
+
+REQUIRED_CONFIG_KEYS = [
+    "linux_user",
+    "linux_ssh_port",
+    "cf_hostname_linux",
+    "identity_file",
+    "default_name",
+    "work_dir",
+    "venv_path",
+]
+
+
+def _load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        raise RuntimeError(
+            f"GPUWS client config not found at {CONFIG_PATH}. "
+            "Run the generated client installer first."
+        )
+
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in {CONFIG_PATH}: {exc}") from exc
+
+    missing = [key for key in REQUIRED_CONFIG_KEYS if not cfg.get(key)]
+    if missing:
+        raise RuntimeError(
+            f"GPUWS client config is missing required fields: {', '.join(missing)}"
+        )
+
+    return cfg
+
+
+_cfg = _load_config()
 
 LINUX_USER = _cfg["linux_user"]
 WINDOWS_USER = _cfg.get("windows_user", "")
 IDENTITY_FILE = _cfg["identity_file"]
-LINUX_SSH_PORT = _cfg["linux_ssh_port"]
-WINDOWS_SSH_PORT = _cfg.get("windows_ssh_port", 22)
+LINUX_SSH_PORT = int(_cfg["linux_ssh_port"])
+WINDOWS_SSH_PORT = int(_cfg.get("windows_ssh_port", 22))
 CF_HOSTNAME_LINUX = _cfg["cf_hostname_linux"]
 CF_HOSTNAME_WIN = _cfg.get("cf_hostname_win", "")
 VENV_PATH = _cfg["venv_path"]
@@ -34,60 +70,129 @@ KERNEL_RUNTIME = f"~/.local/share/jupyter/runtime/kernel-{KERNEL_NAME}.json"
 del _cfg
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\[[0-9;]*$|\x1b$")
+SSH_BLOCK_RE = re.compile(
+    r"(?ms)^Host[ \t]+(?P<name>\S+)\n(?P<body>(?:^[ \t].*\n?)*)"
+)
 
 
-def _run(cmd, check=True, capture_output=False):
+def _run(cmd, check=True, capture_output=False, shell=False):
     return subprocess.run(
         cmd,
-        shell=True,
+        shell=shell,
         check=check,
         capture_output=capture_output,
         text=True,
     )
 
 
+def _cloudflared_path() -> str:
+    if CLOUDFLARED_STABLE_PATH.exists() and CLOUDFLARED_STABLE_PATH.is_file():
+        return str(CLOUDFLARED_STABLE_PATH)
+    result = _run(["which", "cloudflared"], check=False, capture_output=True)
+    path = result.stdout.strip()
+    if path:
+        return path
+    raise RuntimeError(
+        "cloudflared is not available. Rerun the generated GPUWS client installer."
+    )
+
+
+def ensure_cloudflared_available():
+    path = _cloudflared_path()
+    if not Path(path).exists():
+        raise RuntimeError(
+            f"cloudflared expected at {path}, but it does not exist. "
+            "Rerun the generated GPUWS client installer."
+        )
+
+
+def _ssh_base_args(host: str) -> list[str]:
+    return [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        host,
+    ]
+
+
+def _ssh_command(host: str, remote_cmd: str) -> list[str]:
+    return _ssh_base_args(host) + [remote_cmd]
+
+
 def _ssh_linux(cmd, capture_output=False):
-    return _run(f"ssh gpuws-linux {json.dumps(cmd)}", capture_output=capture_output)
+    return _run(_ssh_command("gpuws-linux", cmd), capture_output=capture_output)
 
 
 def _ssh_win(cmd, capture_output=False):
-    return _run(f"ssh gpuws-windows {json.dumps(cmd)}", capture_output=capture_output)
+    return _run(_ssh_command("gpuws-windows", cmd), capture_output=capture_output)
 
 
 def _strip_ansi(text):
     return ANSI_RE.sub("", text)
 
 
-# ── SSH / Cloudflared Checks ──────────────────────────────────────────────────
-def install_cloudflared():
-    if _run("which cloudflared", check=False).returncode == 0:
-        return
-    if sys.platform == "darwin":
-        print("Please install cloudflared: brew install cloudflared")
-        raise SystemExit(1)
-    stable_path = Path.home() / ".local" / "bin" / "cloudflared"
-    stable_path.parent.mkdir(parents=True, exist_ok=True)
-    _run(
-        "curl -fsSL "
-        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 "
-        f"-o {stable_path} && chmod +x {stable_path}"
-    )
+def _read_ssh_block(host_alias: str) -> str:
+    if not SSH_CONFIG_PATH.exists():
+        return ""
+
+    content = SSH_CONFIG_PATH.read_text()
+    for match in SSH_BLOCK_RE.finditer(content):
+        if match.group("name") == host_alias:
+            return match.group("body")
+    return ""
 
 
 def ensure_ssh_aliases():
-    ssh_config = Path.home() / ".ssh" / "config"
-    content = ssh_config.read_text() if ssh_config.exists() else ""
-    missing_linux = "Host gpuws-linux" not in content
-    missing_windows = CF_HOSTNAME_WIN and WINDOWS_USER and "Host gpuws-windows" not in content
-    if missing_linux or missing_windows:
-        print("SSH aliases missing. Run the generated client installer first.")
-        raise RuntimeError("Missing gpuws SSH aliases")
+    linux_block = _read_ssh_block("gpuws-linux")
+    if not linux_block:
+        raise RuntimeError(
+            "SSH alias gpuws-linux is missing. Run the generated client installer first."
+        )
+    if f"HostName {CF_HOSTNAME_LINUX}" not in linux_block:
+        raise RuntimeError(
+            f"SSH alias gpuws-linux does not point to {CF_HOSTNAME_LINUX}. "
+            "Rerun the generated client installer."
+        )
+
+    if CF_HOSTNAME_WIN and WINDOWS_USER:
+        windows_block = _read_ssh_block("gpuws-windows")
+        if not windows_block:
+            raise RuntimeError(
+                "SSH alias gpuws-windows is missing. Run the generated client installer first."
+            )
+        if f"HostName {CF_HOSTNAME_WIN}" not in windows_block:
+            raise RuntimeError(
+                f"SSH alias gpuws-windows does not point to {CF_HOSTNAME_WIN}. "
+                "Rerun the generated client installer."
+            )
+
+
+def preflight_linux_ssh():
+    try:
+        _run(_ssh_command("gpuws-linux", "echo SSH_OK"), capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        stdout = (exc.stdout or "").strip()
+        detail = stderr or stdout or str(exc)
+        raise RuntimeError(
+            "GPUWS SSH precheck failed for gpuws-linux. "
+            f"Details: {detail}\nTry: ssh gpuws-linux"
+        ) from exc
 
 
 # ── Kernel Management ─────────────────────────────────────────────────────────
+
+
 def ensure_kernel():
-    _ssh_linux(f'{KERNEL_MANAGER} create "{KERNEL_NAME}" "{VENV_PYTHON}" "{KERNEL_WORK_DIR}"')
+    _ssh_linux(
+        f'{KERNEL_MANAGER} create "{KERNEL_NAME}" "{VENV_PYTHON}" "{KERNEL_WORK_DIR}"'
+    )
 
 
 def touch_kernel():
@@ -100,15 +205,20 @@ def fetch_kernel_info():
 
 
 def start_port_forwarding(kernel_info):
-    ports = [kernel_info[k] for k in ("shell_port", "iopub_port", "stdin_port", "control_port", "hb_port")]
-    args = ["ssh", "-N"]
+    ports = [
+        kernel_info[k]
+        for k in ("shell_port", "iopub_port", "stdin_port", "control_port", "hb_port")
+    ]
+    args = _ssh_base_args("gpuws-linux")
+    args.insert(1, "-N")
     for port in ports:
         args.extend(["-L", f"{port}:127.0.0.1:{port}"])
-    args.append("gpuws-linux")
     return subprocess.Popen(args)
 
 
 # ── Output Display ────────────────────────────────────────────────────────────
+
+
 def _handle_output(msg, display_handles, progress_handle_box):
     msg_type = msg["msg_type"]
     content = msg.get("content", {})
@@ -129,9 +239,13 @@ def _handle_output(msg, display_handles, progress_handle_box):
                     last_progress = p
             if last_progress is not None:
                 if progress_handle_box[0] is None:
-                    progress_handle_box[0] = display(HTML(f"<pre>{last_progress}</pre>"), display_id=True)
+                    progress_handle_box[0] = display(
+                        HTML(f"<pre>{last_progress}</pre>"), display_id=True
+                    )
                 else:
-                    progress_handle_box[0].update(HTML(f"<pre>{last_progress}</pre>"))
+                    progress_handle_box[0].update(
+                        HTML(f"<pre>{last_progress}</pre>")
+                    )
             return
         print(text, end="")
 
@@ -164,6 +278,8 @@ def _handle_output(msg, display_handles, progress_handle_box):
 
 
 # ── Remote Execution Manager ──────────────────────────────────────────────────
+
+
 class RemoteExecutionManager:
     _LOCAL_PREFIXES = (
         "%remote_on",
@@ -223,13 +339,9 @@ class RemoteExecutionManager:
                 pass
             self.remote_kc = None
 
-        if not CONFIG_PATH.exists():
-            print(f"Config not found at {CONFIG_PATH}")
-            return False
-
-        install_cloudflared()
+        ensure_cloudflared_available()
         ensure_ssh_aliases()
-        _run("ssh -o StrictHostKeyChecking=accept-new gpuws-linux echo SSH_OK", check=False)
+        preflight_linux_ssh()
 
         ensure_kernel()
         kernel_info = fetch_kernel_info()
@@ -268,7 +380,9 @@ class RemoteExecutionManager:
             raise RuntimeError("Remote kernel not connected. Run %remote first.")
         touch_kernel()
         try:
-            reply = self.remote_kc.execute_interactive(code=code, output_hook=self._output_hook)
+            reply = self.remote_kc.execute_interactive(
+                code=code, output_hook=self._output_hook
+            )
         except KeyboardInterrupt:
             print("Interrupted locally, stopping remote job...")
             msg = self.remote_kc.session.msg("interrupt_request")
@@ -289,7 +403,11 @@ class RemoteExecutionManager:
         ip.input_transformers_cleanup[:] = [
             f
             for f in ip.input_transformers_cleanup
-            if not (callable(f) and getattr(f, "__func__", None) and f.__func__.__name__ == "_transform_cell")
+            if not (
+                callable(f)
+                and getattr(f, "__func__", None)
+                and f.__func__.__name__ == "_transform_cell"
+            )
         ]
         ip.input_transformers_cleanup.append(self._transform_cell)
         self._remote_active = True
@@ -303,7 +421,11 @@ class RemoteExecutionManager:
         ip.input_transformers_cleanup[:] = [
             f
             for f in ip.input_transformers_cleanup
-            if not (callable(f) and getattr(f, "__func__", None) and f.__func__.__name__ == "_transform_cell")
+            if not (
+                callable(f)
+                and getattr(f, "__func__", None)
+                and f.__func__.__name__ == "_transform_cell"
+            )
         ]
         self._remote_active = False
         print("Remote execution disabled — cells now run locally")
@@ -339,8 +461,9 @@ if "_exec_mgr" in globals() and _exec_mgr is not None:
 
 _exec_mgr = RemoteExecutionManager()
 
-
 # ── remote_run_ ───────────────────────────────────────────────────────────────
+
+
 def remote_run_(code: str, max_chars: int = 2000) -> str:
     collected = []
 
@@ -363,11 +486,17 @@ def remote_run_(code: str, max_chars: int = 2000) -> str:
     output = "".join(collected)
     if len(output) > max_chars:
         half = max_chars // 2
-        output = output[:half] + f"\n\n... [{len(output) - max_chars} chars truncated] ...\n\n" + output[-half:]
+        output = (
+            output[:half]
+            + f"\n\n... [{len(output) - max_chars} chars truncated] ...\n\n"
+            + output[-half:]
+        )
     return output
 
 
 # ── Magics ────────────────────────────────────────────────────────────────────
+
+
 @register_line_cell_magic
 def restart_windows(line, cell=None):
     if not CF_HOSTNAME_WIN or not WINDOWS_USER:
@@ -429,6 +558,9 @@ def kernel_status(line, cell=None):
     print(f"Connected: {'yes' if _exec_mgr.remote_kc else 'no'}")
     print(f"Kernel name: {KERNEL_NAME}")
     print(f"Work dir: {KERNEL_WORK_DIR}")
+    print(f"Linux hostname: {CF_HOSTNAME_LINUX}")
+    print(f"Identity file: {IDENTITY_FILE}")
+    print(f"cloudflared available: {'yes' if _cloudflared_path() else 'no'}")
 
     if _exec_mgr.remote_kc:
         ok, detail = _exec_mgr.kernel_health()
@@ -446,6 +578,7 @@ def kernel_status(line, cell=None):
 
 
 # ── Auto-connect ──────────────────────────────────────────────────────────────
+
 %remote
 
 print("GPUWS remote kernel loaded")
