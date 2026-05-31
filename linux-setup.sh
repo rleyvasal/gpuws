@@ -191,7 +191,11 @@ apply_defaults() {
     VENV_PATH="${VENV_PATH:-$DEFAULT_ROOT_DIR/.venv}"
 
     if [ -z "${HOST_LABEL:-}" ]; then
-        HOST_LABEL="$(sanitize_host_label "$(hostname)")"
+        if [ "$HOST_TYPE" = "windows-wsl" ]; then
+            HOST_LABEL="$(sanitize_host_label "${LINUX_USER}-gpuws")"
+        else
+            HOST_LABEL="$(sanitize_host_label "$(hostname)")"
+        fi
     fi
 }
 
