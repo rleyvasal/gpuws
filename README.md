@@ -142,6 +142,19 @@ It will:
 13. initialize `~/.config/gpuws/clients.json`
 14. run a host health check
 
+Notes:
+
+- The SSH public key requested during host setup is an admin SSH public key for initial host access.
+- It does not automatically create a managed GPUWS client record.
+- Managed clients are added later with `gpuws client add`.
+
+Cloudflare authentication note:
+
+- Before using the URL shown by `cloudflared tunnel login`, make sure you are already signed in to the correct Cloudflare account in your browser.
+- If the first browser redirect only signs you in, open the displayed login URL again after login to complete tunnel authorization.
+- Click on domain name
+- Click Authorize on popur window
+
 After success, the next step is:
 
 ```bash
