@@ -175,6 +175,12 @@ apply_env_overrides() {
     CF_TUNNEL="${GPUWS_CF_TUNNEL:-${CF_TUNNEL:-}}"
 }
 
+sanitize_host_label() {
+    printf '%s' "$1" \
+      | tr '[:upper:]' '[:lower:]' \
+      | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+}
+
 apply_defaults() {
     HOST_TYPE="${HOST_TYPE:-$DETECTED_HOST_TYPE}"
     LINUX_USER="${LINUX_USER:-$(whoami)}"
@@ -206,15 +212,12 @@ validate_ssh_public_key() {
     return 1
 }
 
-derive_values() {
-    CF_HOSTNAME_LINUX="${HOST_LABEL}.${CF_DOMAIN}"
-
-    if [ "$HOST_TYPE" = "windows-wsl" ]; then
-        CF_HOSTNAME_WIN="${HOST_LABEL}-win.${CF_DOMAIN}"
-    else
-        CF_HOSTNAME_WIN=""
-        WINDOWS_USER=""
-    fi
+validate_required_values() {
+    [ -n "${SSH_PUBLIC_KEY:-}" ] || fail "GPUWS requires an admin SSH public key"
+    validate_ssh_public_key "$SSH_PUBLIC_KEY" || fail "Invalid admin SSH public key"
+    [ -n "${HOST_LABEL:-}" ] || fail "GPUWS requires a host label"
+    [ -n "${CF_DOMAIN:-}" ] || fail "GPUWS requires a Cloudflare domain"
+    [ -n "${CF_TUNNEL:-}" ] || fail "GPUWS requires a Cloudflare tunnel name"
 }
 
 check_or_fail() {
@@ -395,13 +398,10 @@ EOF
 }
 
 derive_values() {
-    local short_host
-    short_host="$(hostname | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+    CF_HOSTNAME_LINUX="${HOST_LABEL}.${CF_DOMAIN}"
 
-    CF_HOSTNAME_LINUX="${LINUX_USER}.${CF_DOMAIN}"
-
-    if [ "$HOST_TYPE" = "windows-wsl" ] && [ -n "${WINDOWS_USER:-}" ]; then
-        CF_HOSTNAME_WIN="${short_host}.${CF_DOMAIN}"
+    if [ "$HOST_TYPE" = "windows-wsl" ]; then
+        CF_HOSTNAME_WIN="${HOST_LABEL}-win.${CF_DOMAIN}"
     else
         CF_HOSTNAME_WIN=""
         WINDOWS_USER=""
@@ -485,7 +485,20 @@ run_health_check() {
     log "Linux SSH: $CF_HOSTNAME_LINUX:$LINUX_SSH_PORT"
 
     if [ "$HOST_TYPE" = "windows-wsl" ]; then
-        log "Windows SSH: $CF_HOSTNAME_WIN:$WINDOWS_SSH_PORT"
+        if [ -n "${CF_HOSTNAME_WIN:-}" ] && [ -n "${WINDOWS_USER:-}" ]; then
+            log "Windows SSH: $CF_HOSTNAME_WIN:$WINDOWS_SSH_PORT"
+        else
+            local win_bootstrap_info=""
+            if win_bootstrap_info="$(windows_bootstrap_status)"; then
+                local win_bootstrap_path=""
+                local win_bootstrap_user=""
+                local win_bootstrap_port=""
+                IFS='|' read -r win_bootstrap_path win_bootstrap_user win_bootstrap_port <<< "$win_bootstrap_info"
+                log "Windows SSH port: ${win_bootstrap_port:-22} (from Windows bootstrap: $win_bootstrap_path)"
+            else
+                log "Windows SSH port: 22 (Windows bootstrap not found)"
+            fi
+        fi
     fi
 
     log "Shared root: $DEFAULT_ROOT_DIR"
