@@ -280,7 +280,12 @@ test_linux_ssh() {
     log "Testing connection to gpuws-linux..."
 
     local ssh_output=""
-    if ssh_output="$(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new gpuws-linux echo GPUWS_OK 2>&1)"; then
+    if ssh_output="$(ssh \
+        -o BatchMode=yes \
+        -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=accept-new \
+        -o LogLevel=ERROR \
+        gpuws-linux echo GPUWS_OK 2>&1)"; then
         log "Connection to gpuws-linux verified"
         return 0
     fi
@@ -297,28 +302,17 @@ test_windows_ssh() {
     log "Testing connection to gpuws-windows..."
 
     local ssh_output=""
-    if ssh_output="$(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new gpuws-windows echo GPUWS_OK 2>&1)"; then
+    if ssh_output="$(ssh \
+        -o BatchMode=yes \
+        -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=accept-new \
+        -o LogLevel=ERROR \
+        gpuws-windows echo GPUWS_OK 2>&1)"; then
         log "Connection to gpuws-windows verified"
         return 0
     fi
 
     print_windows_warning "$ssh_output"
-}
-
-test_windows_ssh() {
-    if [ -z "$CF_HOSTNAME_WIN" ] || [ -z "$WINDOWS_USER" ]; then
-        return 0
-    fi
-
-    log "Testing connection to gpuws-windows..."
-
-    if ssh -o BatchMode=yes -o ConnectTimeout=10 gpuws-windows echo GPUWS_OK >/dev/null 2>&1; then
-        log "Connection to gpuws-windows verified"
-        return 0
-    fi
-
-    print_windows_warning
-    return 0
 }
 
 main() {
