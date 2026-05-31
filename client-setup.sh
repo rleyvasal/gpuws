@@ -209,9 +209,21 @@ Host gpuws-windows
     fi
 }
 
+
 print_linux_failure() {
+    local ssh_error="${1:-}"
+
     echo ""
     echo "GPUWS SSH test failed for gpuws-linux."
+
+    if [ -n "$ssh_error" ]; then
+        echo ""
+        echo "SSH reported:"
+        while IFS= read -r line; do
+            [ -n "$line" ] && echo "  $line"
+        done <<< "$ssh_error"
+    fi
+
     echo ""
     echo "Check the following:"
     echo "  1. Confirm your private key path in ~/.config/gpuws/client.json"
@@ -220,6 +232,12 @@ print_linux_failure() {
     echo "  4. Confirm cloudflared is installed and authenticated"
     echo "  5. Confirm the host tunnel/service is running"
     echo "  6. Check the gpuws-linux entry in ~/.ssh/config"
+
+    if printf '%s' "$ssh_error" | grep -qi 'bad handshake'; then
+        echo "  7. Cloudflare Access may require browser authentication"
+        echo "     Try: cloudflared access login https://$CF_HOSTNAME_LINUX"
+    fi
+
     echo ""
     echo "Try:"
     echo "  ssh gpuws-linux"
@@ -261,12 +279,13 @@ print_success() {
 test_linux_ssh() {
     log "Testing connection to gpuws-linux..."
 
-    if ssh -o BatchMode=yes -o ConnectTimeout=10 gpuws-linux echo GPUWS_OK >/dev/null 2>&1; then
+    local ssh_output=""
+    if ssh_output="$(ssh -o BatchMode=yes -o ConnectTimeout=10 gpuws-linux echo GPUWS_OK 2>&1)"; then
         log "Connection to gpuws-linux verified"
         return 0
     fi
 
-    print_linux_failure
+    print_linux_failure "$ssh_output"
     exit 1
 }
 
